@@ -1,5 +1,5 @@
 """
-Fundamentals API: POST /api/fundamentals (or POST /)
+Fundamentals API: POST /api/fundamentals, POST /fundamentals, or POST /
 Body: {"tickers": ["SSI", "MBB", ...]} -> {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}
 Uses vnstock (Company, Finance) for P/E, P/B, ROE, EPS.
 Supports Render (uvicorn main:app) and Vercel (handler).
@@ -152,6 +152,7 @@ def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
 
 
 @app.post("/api/fundamentals")
+@app.post("/fundamentals")  # alias cho production (Render, etc.)
 @app.post("/")
 def api_fundamentals(req: FundamentalsRequest) -> Dict[str, Any]:
     """POST with {"tickers": ["SSI", "MBB", ...]} -> {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}."""
