@@ -1,7 +1,8 @@
 """
-Vercel Serverless Function: POST /api/fundamentals
+Fundamentals API: POST /api/fundamentals (or POST /)
 Body: {"tickers": ["SSI", "MBB", ...]} -> {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}
-Dùng vnstock (Company, Finance) để lấy P/E, P/B, ROE, EPS.
+Uses vnstock (Company, Finance) for P/E, P/B, ROE, EPS.
+Supports Render (uvicorn main:app) and Vercel (handler).
 """
 from __future__ import annotations
 
@@ -9,6 +10,23 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="Fundamentals API")
+
+
+class FundamentalsRequest(BaseModel):
+    tickers: List[str] = []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Optional: tăng giới hạn vnstock (đăng ký tại https://vnstocks.com/login)
 _api_key = os.environ.get("VNSTOCK_API_KEY")
@@ -131,6 +149,23 @@ def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
                     or overview_row.get("P/B")
                 )
     return {"pe": pe, "pb": pb, "roe": roe, "eps": eps}
+
+
+@app.post("/api/fundamentals")
+@app.post("/")
+def api_fundamentals(req: FundamentalsRequest) -> Dict[str, Any]:
+    """POST with {"tickers": ["SSI", "MBB", ...]} -> {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}."""
+    tickers = req.tickers or []
+    unique = list({str(t).strip().upper() for t in tickers if t})
+    data: Dict[str, Dict[str, Optional[float]]] = {}
+    for symbol in unique:
+        try:
+            item = _extract(symbol, SOURCE)
+            if any(x is not None for x in item.values()):
+                data[symbol] = item
+        except Exception:
+            continue
+    return {"data": data}
 
 
 def handler(req: BaseHTTPRequestHandler):
