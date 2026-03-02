@@ -20,12 +20,26 @@ uvicorn main:app --reload --port 8001
 
 Service lắng nghe tại `http://localhost:8001`.
 
-## 3. Biến môi trường (tuỳ chọn)
+## 3. Biến môi trường
+
+### Chạy local (repo riêng hoặc trong monorepo)
+
+Tạo file `.env` từ mẫu (không commit `.env`):
+
+```bash
+cp .env.example .env
+# Sửa .env: bỏ comment và điền VNSTOCK_API_KEY nếu có
+```
+
+### Deploy (Render / Railway / Cloud Run)
+
+**Không cần** file `.env` trên server. Cấu hình trực tiếp trên dashboard:
 
 | Biến | Ý nghĩa |
 |------|--------|
-| `VNSTOCK_API_KEY` | API key từ [vnstocks.com/login](https://vnstocks.com/login) – tăng giới hạn (60 req/phút Community). Không set thì dùng chế độ Guest (20 req/phút). |
+| `VNSTOCK_API_KEY` | API key từ [vnstocks.com/login](https://vnstocks.com/login) – tăng giới hạn (60 req/phút Community). Không set thì dùng Guest (20 req/phút). |
 | `VNSTOCK_SOURCE` | Nguồn dữ liệu: `KBS` (mặc định) hoặc `VCI`. |
+| `PORT` | Render/Railway tự gán; không cần set thủ công. |
 
 ## 4. API
 
