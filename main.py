@@ -1,16 +1,16 @@
 """
-VN Fundamentals API – dùng vnstock (https://github.com/thinh-vu/vnstock) để lấy P/E, P/B, ROE, EPS.
-Chạy: uvicorn main:app --reload --port 8001
+Vercel Serverless Function: POST /api/fundamentals
+Body: {"tickers": ["SSI", "MBB", ...]} -> {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}
+Dùng vnstock (Company, Finance) để lấy P/E, P/B, ROE, EPS.
 """
 from __future__ import annotations
 
+import json
 import os
+from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-
-# Optional: đăng ký vnstock để tăng giới hạn (60 req/phút Community, không cần thì bỏ qua)
+# Optional: tăng giới hạn vnstock (đăng ký tại https://vnstocks.com/login)
 _api_key = os.environ.get("VNSTOCK_API_KEY")
 if _api_key:
     try:
@@ -21,26 +21,7 @@ if _api_key:
 
 from vnstock import Company, Finance
 
-
-class FundamentalsRequest(BaseModel):
-    tickers: List[str]
-
-
-class FundamentalsItem(BaseModel):
-    pe: Optional[float] = None
-    pb: Optional[float] = None
-    roe: Optional[float] = None
-    eps: Optional[float] = None
-
-
-class FundamentalsResponse(BaseModel):
-    data: Dict[str, FundamentalsItem]
-
-
-app = FastAPI(title="VN Fundamentals Service (vnstock)", version="2.0.0")
-
-# Nguồn dữ liệu: KBS hoặc VCI (vnstock 3.x)
-DEFAULT_SOURCE = "KBS"
+SOURCE = os.environ.get("VNSTOCK_SOURCE", "KBS")
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -48,27 +29,73 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
     try:
         x = float(value)
-        return x if (x == x and abs(x) < 1e15) else None  # reject nan/inf
+        return x if (x == x and abs(x) < 1e15) else None
     except (TypeError, ValueError):
         return None
 
 
-def _get_ratio_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
-    """Lấy dòng chỉ số tài chính mới nhất từ Finance.ratio()."""
+# vnstock ratio() trả về DataFrame: mỗi HÀNG là một chỉ số (P/E, P/B, ROE, EPS),
+# cột là item/item_id + các cột kỳ (2024, 2023, ...). Cần map item_id -> giá trị kỳ mới nhất.
+_ITEM_ID_TO_FIELD = {
+    "pe": "pe",
+    "pe_ratio": "pe",
+    "p_e": "pe",
+    "price_to_earning": "pe",
+    "ty_le_pe": "pe",
+    "pb": "pb",
+    "pb_ratio": "pb",
+    "p_b": "pb",
+    "price_to_book": "pb",
+    "ty_le_pb": "pb",
+    "roe": "roe",
+    "return_on_equity": "roe",
+    "eps": "eps",
+    "earnings_per_share": "eps",
+    "loi_nhuan_tren_co_phieu": "eps",
+    "loi_nhuan_tren_co_phieu_eps": "eps",
+}
+
+
+def _get_ratio_df(symbol: str, source: str):
+    """Lấy DataFrame ratio từ vnstock. Mỗi hàng là một chỉ số."""
     try:
         finance = Finance(symbol=symbol, source=source)
-        df = finance.ratio(period="year", lang="vi")
+        try:
+            df = finance.ratio(period="year", lang="vi")
+        except TypeError:
+            df = finance.ratio(period="year")
     except Exception:
         return None
     if df is None or df.empty:
         return None
-    # Hàng mới nhất (năm gần nhất)
-    row = df.iloc[-1]
-    return row.to_dict() if hasattr(row, "to_dict") else dict(row)
+    return df
+
+
+def _parse_ratio_df_to_metrics(df) -> Dict[str, Optional[float]]:
+    """Từ DataFrame ratio (mỗi hàng = một chỉ số), trích pe, pb, roe, eps từ cột kỳ mới nhất."""
+    out: Dict[str, Optional[float]] = {"pe": None, "pb": None, "roe": None, "eps": None}
+    meta = {"item", "item_id", "item_en", "unit", "levels", "row_number"}
+    period_cols = getattr(df, "attrs", {}).get("periods", [])
+    if not period_cols:
+        period_cols = [c for c in df.columns if c not in meta and str(c).strip()]
+    if not period_cols:
+        return out
+    latest_col = period_cols[0]
+
+    for _, row in df.iterrows():
+        raw = (row.get("item_id") or row.get("item_en") or row.get("item")) or ""
+        item_id = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+        field = _ITEM_ID_TO_FIELD.get(item_id)
+        if not field or field not in out:
+            continue
+        val = row.get(latest_col)
+        if val is None and len(period_cols) > 1:
+            val = row.get(period_cols[1])
+        out[field] = _safe_float(val)
+    return out
 
 
 def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
-    """Lấy overview công ty (có thể có thêm pe, pb, ...)."""
     try:
         company = Company(symbol=symbol, source=source)
         df = company.overview()
@@ -76,65 +103,71 @@ def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
         return None
     if df is None or df.empty:
         return None
-    row = df.iloc[-1]
+    # overview() có thể trả về 1 hàng tổng hợp hoặc nhiều hàng
+    row = df.iloc[0]
     return row.to_dict() if hasattr(row, "to_dict") else dict(row)
 
 
-def _extract_fundamentals(symbol: str, source: str) -> FundamentalsItem:
-    """Gộp dữ liệu từ ratio (và overview nếu cần) thành pe, pb, roe, eps."""
+def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
     pe = pb = roe = eps = None
-
-    ratio_row = _get_ratio_row(symbol, source)
-    if ratio_row:
-        # Cột có thể là tiếng Anh hoặc Việt tùy lang=vi
-        for key in ("pe", "PE", "p_e", "P/E", "priceToEarning"):
-            if key in ratio_row:
-                pe = _safe_float(ratio_row[key])
-                break
-        for key in ("pb", "PB", "p_b", "P/B", "priceToBook"):
-            if key in ratio_row:
-                pb = _safe_float(ratio_row[key])
-                break
-        for key in ("roe", "ROE", "returnOnEquity"):
-            if key in ratio_row:
-                roe = _safe_float(ratio_row[key])
-                break
-        for key in ("eps", "EPS", "earningsPerShare"):
-            if key in ratio_row:
-                eps = _safe_float(ratio_row[key])
-                break
-
-    # Nếu ratio không đủ, thử overview (một số nguồn trả pe/pb ở overview)
-    if (pe is None or pb is None) and ratio_row is None:
+    df = _get_ratio_df(symbol, source)
+    if df is not None:
+        out = _parse_ratio_df_to_metrics(df)
+        pe, pb, roe, eps = out["pe"], out["pb"], out["roe"], out["eps"]
+    # Fallback: overview() nếu ratio không có pe/pb
+    if (pe is None or pb is None) and df is None:
         overview_row = _get_overview_row(symbol, source)
         if overview_row:
-            if pe is None and "pe" in overview_row:
-                pe = _safe_float(overview_row["pe"])
-            if pb is None and "pb" in overview_row:
-                pb = _safe_float(overview_row["pb"])
+            if pe is None:
+                pe = _safe_float(
+                    overview_row.get("pe")
+                    or overview_row.get("pe_ratio")
+                    or overview_row.get("P/E")
+                )
+            if pb is None:
+                pb = _safe_float(
+                    overview_row.get("pb")
+                    or overview_row.get("pb_ratio")
+                    or overview_row.get("P/B")
+                )
+    return {"pe": pe, "pb": pb, "roe": roe, "eps": eps}
 
-    return FundamentalsItem(pe=pe, pb=pb, roe=roe, eps=eps)
+
+def handler(req: BaseHTTPRequestHandler):
+    """Vercel gọi do_POST; req là self (BaseHTTPRequestHandler)."""
+    pass
 
 
-@app.post("/fundamentals", response_model=FundamentalsResponse)
-def get_fundamentals(payload: FundamentalsRequest) -> FundamentalsResponse:
-    """Trả về P/E, P/B, ROE, EPS cho danh sách mã VN qua vnstock (Company + Finance)."""
-    result: Dict[str, FundamentalsItem] = {}
-    source = os.environ.get("VNSTOCK_SOURCE", DEFAULT_SOURCE)
-    unique = list({t.strip().upper() for t in payload.tickers if t and t.strip()})
-
-    for ticker in unique:
+class handler(BaseHTTPRequestHandler):
+    def do_POST(self):
         try:
-            item = _extract_fundamentals(ticker, source)
-            # Chỉ thêm vào result nếu có ít nhất một chỉ số
-            if any(x is not None for x in (item.pe, item.pb, item.roe, item.eps)):
-                result[ticker] = item
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(content_length).decode("utf-8") if content_length else "{}"
+            payload = json.loads(body) if body.strip() else {}
+            tickers = payload.get("tickers") or []
         except Exception:
-            continue
+            tickers = []
 
-    return FundamentalsResponse(data=result)
+        unique = list({str(t).strip().upper() for t in tickers if t})
+        data: Dict[str, Dict[str, Optional[float]]] = {}
+        for symbol in unique:
+            try:
+                item = _extract(symbol, SOURCE)
+                if any(x is not None for x in item.values()):
+                    data[symbol] = item
+            except Exception:
+                continue
 
+        out = json.dumps({"data": data}, ensure_ascii=False)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(out.encode("utf-8"))
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
