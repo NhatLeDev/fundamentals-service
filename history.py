@@ -21,9 +21,7 @@ if _api_key:
 
 from vnstock import Company, Finance
 
-# Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
-_RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
-SOURCES = [s.strip() for s in _RAW_SOURCES.split(",") if s.strip()]
+SOURCE = os.environ.get("VNSTOCK_SOURCE", "KBS")
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -90,22 +88,6 @@ def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
     return {"pe": pe, "pb": pb, "roe": roe, "eps": eps}
 
 
-def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[float]]:
-    """Thử lần lượt nhiều nguồn vnstock cho tới khi lấy được ít nhất một chỉ số."""
-    last_item: Dict[str, Optional[float]] = {
-        "pe": None,
-        "pb": None,
-        "roe": None,
-        "eps": None,
-    }
-    for src in sources:
-        item = _extract(symbol, src)
-        if any(x is not None for x in item.values()):
-            return item
-        last_item = item
-    return last_item
-
-
 def handler(req: BaseHTTPRequestHandler):
     """Vercel gọi do_POST; req là self (BaseHTTPRequestHandler)."""
     pass
@@ -125,7 +107,7 @@ class handler(BaseHTTPRequestHandler):
         data: Dict[str, Dict[str, Optional[float]]] = {}
         for symbol in unique:
             try:
-                item = _extract_for_sources(symbol, SOURCES)
+                item = _extract(symbol, SOURCE)
                 if any(x is not None for x in item.values()):
                     data[symbol] = item
             except Exception:
