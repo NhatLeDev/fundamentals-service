@@ -1,7 +1,8 @@
 """
-Vercel Serverless Function: POST /api/fundamentals
+Fundamentals API: POST /api/fundamentals (or POST /)
 Body: {"tickers": ["SSI", "MBB", ...]} -> {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}
-Dùng vnstock (Company, Finance) để lấy P/E, P/B, ROE, EPS.
+Uses vnstock (Company, Finance) to get P/E, P/B, ROE, EPS.
+Supports both Render (uvicorn main:app) and Vercel (handler).
 """
 from __future__ import annotations
 
@@ -9,6 +10,10 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Optional: tăng giới hạn vnstock (đăng ký tại https://vnstocks.com/login)
 _api_key = os.environ.get("VNSTOCK_API_KEY")
@@ -20,6 +25,19 @@ if _api_key:
         pass
 
 from vnstock import Company, Finance
+
+app = FastAPI(title="Fundamentals API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class FundamentalsRequest(BaseModel):
+    tickers: List[str] = []
 
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
 _RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
@@ -104,6 +122,31 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[
             return item
         last_item = item
     return last_item
+
+
+@app.post("/api/fundamentals")
+@app.post("/")
+def api_fundamentals(req: FundamentalsRequest) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    FastAPI endpoint for fundamentals.
+
+    Request body:
+        {"tickers": ["SSI", "MBB", ...]}
+
+    Response:
+        {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}
+    """
+    tickers = req.tickers or []
+    unique = list({str(t).strip().upper() for t in tickers if t})
+    data: Dict[str, Dict[str, Optional[float]]] = {}
+    for symbol in unique:
+        try:
+            item = _extract_for_sources(symbol, SOURCES)
+            if any(x is not None for x in item.values()):
+                data[symbol] = item
+        except Exception:
+            continue
+    return {"data": data}
 
 
 def handler(req: BaseHTTPRequestHandler):
