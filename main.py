@@ -39,6 +39,17 @@ app.add_middleware(
 class FundamentalsRequest(BaseModel):
     tickers: List[str] = []
 
+
+class FundamentalsItem(BaseModel):
+    pe: Optional[float] = None
+    pb: Optional[float] = None
+    roe: Optional[float] = None
+    eps: Optional[float] = None
+
+
+class FundamentalsResponse(BaseModel):
+    data: Dict[str, FundamentalsItem]
+
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
 _RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
 SOURCES = [s.strip() for s in _RAW_SOURCES.split(",") if s.strip()]
@@ -154,7 +165,7 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[
 @app.post("/api/fundamentals")
 @app.post("/fundamentals")
 @app.post("/")
-def api_fundamentals(req: FundamentalsRequest) -> Dict[str, Dict[str, Optional[float]]]:
+def api_fundamentals(req: FundamentalsRequest) -> FundamentalsResponse:
     """
     FastAPI endpoint for fundamentals.
 
@@ -166,15 +177,15 @@ def api_fundamentals(req: FundamentalsRequest) -> Dict[str, Dict[str, Optional[f
     """
     tickers = req.tickers or []
     unique = list({str(t).strip().upper() for t in tickers if t})
-    data: Dict[str, Dict[str, Optional[float]]] = {}
+    data: Dict[str, FundamentalsItem] = {}
     for symbol in unique:
         try:
             item = _extract_for_sources(symbol, SOURCES)
             if any(x is not None for x in item.values()):
-                data[symbol] = item
+                data[symbol] = FundamentalsItem(**item)
         except Exception:
             continue
-    return {"data": data}
+    return FundamentalsResponse(data=data)
 
 
 def handler(req: BaseHTTPRequestHandler):
