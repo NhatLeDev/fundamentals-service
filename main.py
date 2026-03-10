@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # Optional: tăng giới hạn vnstock (đăng ký tại https://vnstocks.com/login)
@@ -38,17 +39,6 @@ app.add_middleware(
 
 class FundamentalsRequest(BaseModel):
     tickers: List[str] = []
-
-
-class FundamentalsItem(BaseModel):
-    pe: Optional[float] = None
-    pb: Optional[float] = None
-    roe: Optional[float] = None
-    eps: Optional[float] = None
-
-
-class FundamentalsResponse(BaseModel):
-    data: Dict[str, FundamentalsItem]
 
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
 _RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
@@ -165,7 +155,7 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[
 @app.post("/api/fundamentals")
 @app.post("/fundamentals")
 @app.post("/")
-def api_fundamentals(req: FundamentalsRequest) -> FundamentalsResponse:
+def api_fundamentals(req: FundamentalsRequest):
     """
     FastAPI endpoint for fundamentals.
 
@@ -177,15 +167,16 @@ def api_fundamentals(req: FundamentalsRequest) -> FundamentalsResponse:
     """
     tickers = req.tickers or []
     unique = list({str(t).strip().upper() for t in tickers if t})
-    data: Dict[str, FundamentalsItem] = {}
+    data: Dict[str, Dict[str, float]] = {}
     for symbol in unique:
         try:
             item = _extract_for_sources(symbol, SOURCES)
             if any(x is not None for x in item.values()):
-                data[symbol] = FundamentalsItem(**item)
+                # Loại bỏ None để tránh ResponseValidationError
+                data[symbol] = {k: v for k, v in item.items() if v is not None}
         except Exception:
             continue
-    return FundamentalsResponse(data=data)
+    return JSONResponse(content={"data": data})
 
 
 def handler(req: BaseHTTPRequestHandler):
