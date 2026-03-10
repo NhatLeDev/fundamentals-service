@@ -54,21 +54,58 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def _get_ratio_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
+# Map item_id từ vnstock ratio() -> field output (pe, pb, roe, eps)
+_ITEM_ID_TO_FIELD = {
+    "pe": "pe", "pe_ratio": "pe", "p_e": "pe", "price_to_earning": "pe", "ty_le_pe": "pe",
+    "pb": "pb", "pb_ratio": "pb", "p_b": "pb", "price_to_book": "pb", "ty_le_pb": "pb",
+    "roe": "roe", "return_on_equity": "roe",
+    "eps": "eps", "earnings_per_share": "eps", "loi_nhuan_tren_co_phieu": "eps",
+}
+
+
+def _get_ratio_df(symbol: str, source: str):
+    """Lấy DataFrame ratio từ vnstock. Mỗi hàng = một chỉ số (PE, PB, ROE, EPS...)."""
     try:
         finance = Finance(symbol=symbol, source=source)
-        df = finance.ratio(period="year", lang="vi")
+        try:
+            df = finance.ratio(period="year", lang="vi")
+        except TypeError:
+            df = finance.ratio(period="year", display_mode="vi")
     except Exception:
         return None
     if df is None or df.empty:
         return None
-    row = df.iloc[-1]
-    return row.to_dict() if hasattr(row, "to_dict") else dict(row)
+    return df
+
+
+def _parse_ratio_df(df) -> Dict[str, Optional[float]]:
+    """Từ DataFrame ratio (mỗi hàng = một chỉ số), trích pe, pb, roe, eps từ cột kỳ mới nhất."""
+    out: Dict[str, Optional[float]] = {"pe": None, "pb": None, "roe": None, "eps": None}
+    meta = {"item", "item_id", "item_en", "unit", "levels", "row_number"}
+    period_cols = [c for c in df.columns if c not in meta and str(c).strip()]
+    if not period_cols:
+        return out
+    latest_col = period_cols[0]
+
+    for _, row in df.iterrows():
+        raw = (row.get("item_id") or row.get("item_en") or row.get("item")) or ""
+        item_id = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+        field = _ITEM_ID_TO_FIELD.get(item_id)
+        if not field or field not in out:
+            continue
+        val = row.get(latest_col)
+        if val is None and len(period_cols) > 1:
+            val = row.get(period_cols[1])
+        out[field] = _safe_float(val)
+    return out
 
 
 def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
     try:
-        company = Company(symbol=symbol, source=source)
+        try:
+            company = Company(symbol=symbol, source=source)
+        except TypeError:
+            company = Company(symbol=symbol)
         df = company.overview()
     except Exception:
         return None
@@ -80,31 +117,21 @@ def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
 
 def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
     pe = pb = roe = eps = None
-    ratio_row = _get_ratio_row(symbol, source)
-    if ratio_row:
-        for key in ("pe", "PE", "p_e", "P/E", "priceToEarning"):
-            if key in ratio_row:
-                pe = _safe_float(ratio_row[key])
-                break
-        for key in ("pb", "PB", "p_b", "P/B", "priceToBook"):
-            if key in ratio_row:
-                pb = _safe_float(ratio_row[key])
-                break
-        for key in ("roe", "ROE", "returnOnEquity"):
-            if key in ratio_row:
-                roe = _safe_float(ratio_row[key])
-                break
-        for key in ("eps", "EPS", "earningsPerShare"):
-            if key in ratio_row:
-                eps = _safe_float(ratio_row[key])
-                break
-    if (pe is None or pb is None) and ratio_row is None:
+    df = _get_ratio_df(symbol, source)
+    if df is not None:
+        out = _parse_ratio_df(df)
+        pe, pb, roe, eps = out["pe"], out["pb"], out["roe"], out["eps"]
+    if (pe is None or pb is None) and df is None:
         overview_row = _get_overview_row(symbol, source)
         if overview_row:
-            if pe is None and "pe" in overview_row:
-                pe = _safe_float(overview_row["pe"])
-            if pb is None and "pb" in overview_row:
-                pb = _safe_float(overview_row["pb"])
+            if pe is None:
+                pe = _safe_float(
+                    overview_row.get("pe") or overview_row.get("pe_ratio") or overview_row.get("P/E")
+                )
+            if pb is None:
+                pb = _safe_float(
+                    overview_row.get("pb") or overview_row.get("pb_ratio") or overview_row.get("P/B")
+                )
     return {"pe": pe, "pb": pb, "roe": roe, "eps": eps}
 
 
@@ -125,6 +152,7 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[
 
 
 @app.post("/api/fundamentals")
+@app.post("/fundamentals")
 @app.post("/")
 def api_fundamentals(req: FundamentalsRequest) -> Dict[str, Dict[str, Optional[float]]]:
     """
