@@ -27,6 +27,20 @@ if _api_key:
 
 from vnstock import Company, Finance
 
+# VN-Index: thử nhiều API vnstock (Quote, stock_historical_data, get_index_series)
+try:
+    from vnstock import Quote
+except ImportError:
+    Quote = None
+try:
+    from vnstock import stock_historical_data
+except ImportError:
+    stock_historical_data = None
+try:
+    from vnstock import get_index_series
+except ImportError:
+    get_index_series = None
+
 app = FastAPI(title="Fundamentals API")
 app.add_middleware(
     CORSMiddleware,
@@ -150,6 +164,122 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[
             return item
         last_item = item
     return last_item
+
+
+def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
+    """Lấy chuỗi giá đóng cửa VN-Index từ vnstock. Cần ~250 phiên để tính MA200."""
+    if days <= 0:
+        days = 250
+
+    # 1) Quote.history (vnstock 3.x+)
+    if Quote is not None:
+        try:
+            from datetime import date, timedelta
+            end_d = date.today()
+            start_d = end_d - timedelta(days=days * 2)
+            quote = Quote(symbol="VNINDEX", source="VCI")
+            df = quote.history(start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"), interval="1D")
+            if df is not None and not df.empty:
+                close_col = getattr(df, "close", None) or df.get("close")
+                if close_col is not None:
+                    prices = _safe_float_list(close_col)
+                    if len(prices) >= 20:
+                        return prices[-days:] if len(prices) > days else prices
+        except Exception:
+            pass
+
+    # 2) get_index_series
+    if get_index_series is not None:
+        try:
+            df = get_index_series(index_code="VNINDEX", time_range="OneYear")
+            if df is not None and len(df) > 0:
+                col = getattr(df, "indexValue", None) or df.get("indexValue") or df.get("close")
+                if col is not None:
+                    prices = _safe_float_list(col.tolist() if hasattr(col, "tolist") else list(col))
+                    if len(prices) >= 20:
+                        return prices[-days:] if len(prices) > days else prices
+        except Exception:
+            pass
+
+    # 3) stock_historical_data với type=index
+    if stock_historical_data is not None:
+        try:
+            from datetime import date, timedelta
+            end_d = date.today()
+            start_d = end_d - timedelta(days=days * 2)
+            df = stock_historical_data(
+                symbol="VNINDEX",
+                start_date=start_d.strftime("%Y-%m-%d"),
+                end_date=end_d.strftime("%Y-%m-%d"),
+                type="index",
+            )
+            if df is not None and not df.empty:
+                close_col = getattr(df, "close", None) or df.get("close")
+                if close_col is not None:
+                    prices = _safe_float_list(close_col.tolist() if hasattr(close_col, "tolist") else list(close_col))
+                    if len(prices) >= 20:
+                        return prices[-days:] if len(prices) > days else prices
+        except Exception:
+            pass
+
+    return None
+
+
+def _safe_float_list(seq: Any) -> List[float]:
+    out: List[float] = []
+    if seq is None:
+        return out
+    try:
+        arr = seq.tolist() if hasattr(seq, "tolist") else list(seq)
+    except Exception:
+        return out
+    for v in arr:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            continue
+        if x == x and abs(x) < 1e15:
+            out.append(x)
+    return out
+
+
+def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
+    """Tính last, ma20, ma50, ma200 từ chuỗi giá VN-Index."""
+    prices = _get_vnindex_close_prices(250)
+    if not prices or len(prices) < 20:
+        return None
+
+    last = prices[-1]
+    if last < 100 or last > 5000:
+        return None
+
+    def sma(arr: List[float], period: int) -> Optional[float]:
+        if len(arr) < period:
+            return None
+        return sum(arr[-period:]) / period
+
+    ma20_val = sma(prices, 20)
+    ma50_val = sma(prices, 50)
+    ma200_val = sma(prices, 200)
+    return {
+        "last": round(last, 2),
+        "ma20": round(ma20_val, 2) if ma20_val is not None else None,
+        "ma50": round(ma50_val, 2) if ma50_val is not None else None,
+        "ma200": round(ma200_val, 2) if ma200_val is not None else None,
+    }
+
+
+@app.get("/api/vnindex-overview")
+@app.get("/vnindex-overview")
+def api_vnindex_overview():
+    """
+    GET VN-Index overview: last, MA(20), MA(50), MA(200).
+    Dùng cho đánh giá xu hướng thị trường chung trong báo cáo phân tích.
+    """
+    result = _compute_vnindex_overview()
+    if result is None:
+        return JSONResponse(content={"error": "Không lấy được dữ liệu VN-Index"}, status_code=503)
+    return JSONResponse(content=result)
 
 
 @app.post("/api/fundamentals")

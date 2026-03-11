@@ -35,11 +35,11 @@ cp .env.example .env
 
 **Không cần** file `.env` trên server. Cấu hình trực tiếp trên dashboard:
 
-| Biến | Ý nghĩa |
-|------|--------|
+| Biến              | Ý nghĩa                                                                                                                                      |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `VNSTOCK_API_KEY` | API key từ [vnstocks.com/login](https://vnstocks.com/login) – tăng giới hạn (60 req/phút Community). Không set thì dùng Guest (20 req/phút). |
-| `VNSTOCK_SOURCE` | Nguồn dữ liệu: `KBS` (mặc định) hoặc `VCI`. |
-| `PORT` | Render/Railway tự gán; không cần set thủ công. |
+| `VNSTOCK_SOURCE`  | Nguồn dữ liệu: `KBS` (mặc định) hoặc `VCI`.                                                                                                  |
+| `PORT`            | Render/Railway tự gán; không cần set thủ công.                                                                                               |
 
 ## 4. API
 
@@ -66,6 +66,24 @@ cp .env.example .env
 
 - Mã không lấy được sẽ không có trong `data`.
 - Dữ liệu lấy từ `vnstock`: `Finance(symbol, source=...).ratio(period='year')` và `Company(...).overview()`.
+
+### GET `/api/vnindex-overview`
+
+Trả về tổng quan VN-Index: giá đóng cửa gần nhất và MA(20/50/200) để đánh giá xu hướng thị trường.
+
+**Response:**
+
+```json
+{
+  "last": 1268.45,
+  "ma20": 1255.32,
+  "ma50": 1240.18,
+  "ma200": 1180.5
+}
+```
+
+- Dùng cho báo cáo phân tích khi cần nhận định xu hướng thị trường chung.
+- `fetchVnIndexOverview()` trong `market-api.ts` gọi endpoint này khi có `FUNDAMENTALS_API_URL` hoặc `VNINDEX_OVERVIEW_API_URL`.
 
 ## 5. Tích hợp Next.js
 
