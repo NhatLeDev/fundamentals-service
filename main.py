@@ -167,24 +167,48 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[
 
 
 def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
-    """Lấy chuỗi giá đóng cửa VN-Index từ vnstock. Cần ~250 phiên để tính MA200."""
+    """Lấy chuỗi giá đóng cửa VN-Index. KBS hoạt động trên cloud (Render); VCI có thể bị chặn."""
     if days <= 0:
         days = 250
 
-    # 1) Quote.history (vnstock 3.x+)
+    def _extract_close(df) -> Optional[List[float]]:
+        if df is None or (hasattr(df, "empty") and df.empty) or len(df) == 0:
+            return None
+        col_names = ("close", "Close", "indexValue", "index_value")
+        for col_name in col_names:
+            col = None
+            if hasattr(df, "columns") and col_name in df.columns:
+                col = df[col_name]
+            elif hasattr(df, col_name):
+                col = getattr(df, col_name)
+            if col is not None:
+                prices = _safe_float_list(col)
+                if len(prices) >= 20:
+                    return prices[-days:] if len(prices) > days else prices
+        return None
+
+    # 1) Quote.history - KBS trước (hoạt động trên Render/Colab), sau đó VCI
     if Quote is not None:
+        for source in ("KBS", "VCI"):
+            try:
+                quote = Quote(symbol="VNINDEX", source=source)
+                # length="1Y" ~ 252 phiên, đủ MA200
+                df = quote.history(length="1Y", interval="1D")
+                prices = _extract_close(df)
+                if prices:
+                    return prices
+            except Exception:
+                continue
+        # Thử start/end nếu length không được hỗ trợ
         try:
             from datetime import date, timedelta
             end_d = date.today()
             start_d = end_d - timedelta(days=days * 2)
-            quote = Quote(symbol="VNINDEX", source="VCI")
+            quote = Quote(symbol="VNINDEX", source="KBS")
             df = quote.history(start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"), interval="1D")
-            if df is not None and not df.empty:
-                close_col = getattr(df, "close", None) or df.get("close")
-                if close_col is not None:
-                    prices = _safe_float_list(close_col)
-                    if len(prices) >= 20:
-                        return prices[-days:] if len(prices) > days else prices
+            prices = _extract_close(df)
+            if prices:
+                return prices
         except Exception:
             pass
 
@@ -192,35 +216,61 @@ def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
     if get_index_series is not None:
         try:
             df = get_index_series(index_code="VNINDEX", time_range="OneYear")
-            if df is not None and len(df) > 0:
-                col = getattr(df, "indexValue", None) or df.get("indexValue") or df.get("close")
-                if col is not None:
-                    prices = _safe_float_list(col.tolist() if hasattr(col, "tolist") else list(col))
-                    if len(prices) >= 20:
-                        return prices[-days:] if len(prices) > days else prices
+            prices = _extract_close(df)
+            if prices:
+                return prices
         except Exception:
             pass
 
-    # 3) stock_historical_data với type=index
+    # 3) stock_historical_data
     if stock_historical_data is not None:
         try:
             from datetime import date, timedelta
             end_d = date.today()
             start_d = end_d - timedelta(days=days * 2)
-            df = stock_historical_data(
-                symbol="VNINDEX",
-                start_date=start_d.strftime("%Y-%m-%d"),
-                end_date=end_d.strftime("%Y-%m-%d"),
-                type="index",
-            )
-            if df is not None and not df.empty:
-                close_col = getattr(df, "close", None) or df.get("close")
-                if close_col is not None:
-                    prices = _safe_float_list(close_col.tolist() if hasattr(close_col, "tolist") else list(close_col))
-                    if len(prices) >= 20:
-                        return prices[-days:] if len(prices) > days else prices
+            start_str = start_d.strftime("%Y-%m-%d")
+            end_str = end_d.strftime("%Y-%m-%d")
+            for kwargs in [
+                {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str, "type": "index"},
+                {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str},
+            ]:
+                try:
+                    df = stock_historical_data(**kwargs)
+                    prices = _extract_close(df)
+                    if prices:
+                        return prices
+                except TypeError:
+                    try:
+                        df = stock_historical_data("VNINDEX", start_str, end_str)
+                        prices = _extract_close(df)
+                        if prices:
+                            return prices
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    # 4) Fallback: Yahoo Finance (^VNINDEX hoặc VNINDEX.VN)
+    for yahoo_symbol in ("%5EVNINDEX", "VNINDEX.VN"):
+        try:
+            import urllib.request
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1d&range=1y"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Vnstock/1.0)"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                import json as _json
+                data = _json.loads(resp.read().decode())
+            results = data.get("chart", {}).get("result") or []
+            if not results:
+                continue
+            quote = results[0].get("indicators", {}).get("quote") or [{}]
+            closes = quote[0].get("close") if quote else []
+            if not closes:
+                continue
+            prices = [float(c) for c in closes if c is not None and isinstance(c, (int, float))]
+            if len(prices) >= 20:
+                return prices[-days:] if len(prices) > days else prices
+        except Exception:
+            continue
 
     return None
 
