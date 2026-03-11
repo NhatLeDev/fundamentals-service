@@ -187,9 +187,9 @@ def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
                     return prices[-days:] if len(prices) > days else prices
         return None
 
-    # 1) Quote.history - KBS trước (hoạt động trên Render/Colab), sau đó VCI
+    # 1) Quote.history - KBS/TCBS/DNSE (cloud), VCI (có thể bị chặn)
     if Quote is not None:
-        for source in ("KBS", "VCI"):
+        for source in ("KBS", "TCBS", "DNSE", "VCI"):
             try:
                 quote = Quote(symbol="VNINDEX", source=source)
                 # length="1Y" ~ 252 phiên, đủ MA200
@@ -250,7 +250,38 @@ def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
         except Exception:
             pass
 
-    # 4) Fallback: Yahoo Finance (^VNINDEX hoặc VNINDEX.VN)
+    # 4) Fallback: Robotstock API (miễn phí 50 req/ngày, hoạt động từ server)
+    try:
+        import urllib.request
+        rkey = os.environ.get("ROBOTSTOCK_API_KEY", "demo")
+        url = f"https://api.robotstock.info.vn/api_data?type=his_stock&sym=VNINDEX&key={rkey}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            import json as _json
+            rows = _json.loads(resp.read().decode())
+        if isinstance(rows, list) and len(rows) >= 20:
+            # Sắp xếp theo Date (YYYYMMDD), lấy Close. Robotstock trả giá * 50 (vd: 62975 = 1259.5)
+            sorted_rows = sorted(rows, key=lambda r: r.get("Date", ""), reverse=True)
+            prices = []
+            for r in sorted_rows:
+                c = r.get("Close") or r.get("close")
+                if c is not None:
+                    try:
+                        v = float(c)
+                        if v > 0 and v < 1e15:
+                            prices.append(v)
+                    except (TypeError, ValueError):
+                        pass
+            if len(prices) >= 20:
+                prices = list(reversed(prices))  # cũ nhất -> mới nhất
+                # Chuẩn hóa: nếu giá > 5000 thì chia 50 (format Robotstock)
+                if max(prices) > 5000:
+                    prices = [p / 50.0 for p in prices]
+                return prices[-days:] if len(prices) > days else prices
+    except Exception:
+        pass
+
+    # 5) Fallback: Yahoo Finance (^VNINDEX hoặc VNINDEX.VN)
     for yahoo_symbol in ("%5EVNINDEX", "VNINDEX.VN"):
         try:
             import urllib.request
