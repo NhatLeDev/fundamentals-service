@@ -58,14 +58,29 @@ cp .env.example .env
 ```json
 {
   "data": {
-    "SSI": { "pe": 7.19, "pb": 1.02, "roe": 18.5, "eps": 3500 },
+    "SSI": {
+      "pe": 7.19,
+      "pb": 1.02,
+      "roe": 18.5,
+      "eps": 3500,
+      "cash_flow_operating": 1234567890000,
+      "cash_flow_net": 500000000000,
+      "trading_flow": {
+        "foreign_net_value": 10000000000,
+        "foreign_net_volume": 500000,
+        "proprietary_net_value": -2000000000,
+        "proprietary_net_volume": -100000
+      }
+    },
     "MBB": { "pe": 6.85, "pb": 0.95, "roe": 17.2, "eps": 3200 }
   }
 }
 ```
 
 - Mã không lấy được sẽ không có trong `data`.
-- Dữ liệu lấy từ `vnstock`: `Finance(symbol, source=...).ratio(period='year')` và `Company(...).overview()`.
+- **Dòng tiền (cash flow):** `cash_flow_operating` (lưu chuyển tiền từ hoạt động kinh doanh), `cash_flow_net` (tăng/giảm tiền thuần) từ `Finance(...).cash_flow(period='year')` (KBS/VCI). Có thể thiếu nếu nguồn không trả về.
+- **Khối ngoại & tự doanh:** `trading_flow` chỉ xuất hiện nếu cài thêm [vnstock-data](https://github.com/vuthanhdatt/vnstock-data-python) (`pip install git+https://github.com/vuthanhdatt/vnstock-data-python.git`). Gồm `foreign_net_value`, `foreign_net_volume`, `proprietary_net_value`, `proprietary_net_volume` (tổng 30 ngày gần nhất). Không cài thì phần này đánh giá ở mức tổng quát.
+- Dữ liệu cơ bản lấy từ `vnstock`: `Finance(symbol, source=...).ratio(period='year')`, `Finance(...).cash_flow(period='year')` và `Company(...).overview()`.
 
 ### GET `/api/vnindex-overview`
 

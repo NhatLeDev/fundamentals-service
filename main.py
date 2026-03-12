@@ -27,6 +27,13 @@ if _api_key:
 
 from vnstock import Company, Finance
 
+# Khối ngoại / Tự doanh: optional vnstock_data (pip install from GitHub)
+_Trading = None
+try:
+    from vnstock_data import Trading as _Trading
+except Exception:
+    pass
+
 # VN-Index: thử nhiều API vnstock (Quote, stock_historical_data, get_index_series)
 try:
     from vnstock import Quote
@@ -77,6 +84,22 @@ _ITEM_ID_TO_FIELD = {
     "eps": "eps", "earnings_per_share": "eps", "loi_nhuan_tren_co_phieu": "eps",
 }
 
+# Map item_id từ cash_flow() -> field (dòng tiền: hoạt động kinh doanh, tăng/giảm tiền thuần)
+# KBS: dòng tiêu đề "I. Lưu chuyển tiền tệ..." có thể NaN; lấy dòng con có số (net_cash_flows_...)
+_CASH_FLOW_ITEM_IDS = (
+    "net_cash_flows_from_operating_activities",
+    "net_cash_from_operating_activities",
+    "luu_chuyen_tien_thuan_tu_hoat_dong_kinh_doanh",
+    "cash_from_operations",
+    "operating_activities",
+)
+_NET_CASH_ITEM_IDS = (
+    "net_increase_decrease_in_cash_and_cash_equivalents",
+    "net_increase_decrease_in_cash",
+    "increase_decrease_in_cash_and_cash_equivalents",
+    "tang_giam_thuan_tien_va_tuong_duong_tien",
+)
+
 
 def _get_ratio_df(symbol: str, source: str):
     """Lấy DataFrame ratio từ vnstock. Mỗi hàng = một chỉ số (PE, PB, ROE, EPS...)."""
@@ -91,6 +114,49 @@ def _get_ratio_df(symbol: str, source: str):
     if df is None or df.empty:
         return None
     return df
+
+
+def _get_cash_flow_df(symbol: str, source: str):
+    """Lấy DataFrame báo cáo lưu chuyển tiền tệ (Finance.cash_flow)."""
+    try:
+        finance = Finance(symbol=symbol, source=source)
+        try:
+            df = finance.cash_flow(period="year", lang="vi")
+        except TypeError:
+            df = finance.cash_flow(period="year", display_mode="vi")
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    return df
+
+
+def _parse_cash_flow_df(df) -> Dict[str, Optional[float]]:
+    """Trích dòng tiền từ hoạt động kinh doanh và tăng/giảm tiền thuần từ cột kỳ mới nhất."""
+    out: Dict[str, Optional[float]] = {
+        "cash_flow_operating": None,
+        "cash_flow_net": None,
+    }
+    meta = {"item", "item_id", "item_en", "unit", "levels", "row_number"}
+    period_cols = [c for c in df.columns if c not in meta and str(c).strip()]
+    if not period_cols:
+        return out
+    latest_col = period_cols[0]
+
+    for _, row in df.iterrows():
+        raw = (row.get("item_id") or row.get("item_en") or row.get("item")) or ""
+        item_id = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+        val = row.get(latest_col)
+        if val is None and len(period_cols) > 1:
+            val = row.get(period_cols[1])
+        v = _safe_float(val)
+        if v is None:
+            continue
+        if out["cash_flow_operating"] is None and any(x in item_id for x in _CASH_FLOW_ITEM_IDS):
+            out["cash_flow_operating"] = v
+        if out["cash_flow_net"] is None and any(x in item_id for x in _NET_CASH_ITEM_IDS):
+            out["cash_flow_net"] = v
+    return out
 
 
 def _parse_ratio_df(df) -> Dict[str, Optional[float]]:
@@ -115,6 +181,60 @@ def _parse_ratio_df(df) -> Dict[str, Optional[float]]:
     return out
 
 
+def _get_trading_flow(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
+    """
+    Lấy dòng tiền khối ngoại và tự doanh (nếu có vnstock_data).
+    Trả về: foreign_net_value, foreign_net_volume, proprietary_net_value, proprietary_net_volume.
+    """
+    if _Trading is None:
+        return None
+    try:
+        from datetime import date, timedelta
+        end_d = date.today()
+        start_d = end_d - timedelta(days=days)
+        start_str = start_d.strftime("%Y-%m-%d")
+        end_str = end_d.strftime("%Y-%m-%d")
+        trading = _Trading(symbol=symbol, source="vci")
+        out: Dict[str, Any] = {}
+        # Khối ngoại
+        try:
+            fr_df = trading.foreign_trade(start=start_str, end=end_str)
+            if fr_df is not None and not (hasattr(fr_df, "empty") and fr_df.empty):
+                if hasattr(fr_df, "sum"):
+                    s = fr_df.sum()
+                    out["foreign_net_value"] = _safe_float(s.get("fr_net_value"))
+                    out["foreign_net_volume"] = _safe_float(s.get("fr_net_volume"))
+                elif isinstance(fr_df, dict):
+                    out["foreign_net_value"] = _safe_float(fr_df.get("fr_net_value"))
+                    out["foreign_net_volume"] = _safe_float(fr_df.get("fr_net_volume"))
+        except Exception:
+            pass
+        # Tự doanh
+        try:
+            prop_df = trading.prop_trade(start=start_str, end=end_str, resolution="1D")
+            if prop_df is not None and not (hasattr(prop_df, "empty") and prop_df.empty):
+                if hasattr(prop_df, "sum"):
+                    s = prop_df.sum()
+                    out["proprietary_net_value"] = _safe_float(
+                        s.get("total_trade_net_value") or s.get("total_deal_trade_net_value")
+                    )
+                    out["proprietary_net_volume"] = _safe_float(
+                        s.get("total_trade_net_volume") or s.get("total_deal_trade_net_volume")
+                    )
+                elif isinstance(prop_df, dict):
+                    out["proprietary_net_value"] = _safe_float(
+                        prop_df.get("total_trade_net_value") or prop_df.get("total_deal_trade_net_value")
+                    )
+                    out["proprietary_net_volume"] = _safe_float(
+                        prop_df.get("total_trade_net_volume") or prop_df.get("total_deal_trade_net_volume")
+                    )
+        except Exception:
+            pass
+        return out if out else None
+    except Exception:
+        return None
+
+
 def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
     try:
         try:
@@ -130,8 +250,9 @@ def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
     return row.to_dict() if hasattr(row, "to_dict") else dict(row)
 
 
-def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
+def _extract(symbol: str, source: str) -> Dict[str, Any]:
     pe = pb = roe = eps = None
+    cash_flow_operating = cash_flow_net = None
     df = _get_ratio_df(symbol, source)
     if df is not None:
         out = _parse_ratio_df(df)
@@ -147,12 +268,31 @@ def _extract(symbol: str, source: str) -> Dict[str, Optional[float]]:
                 pb = _safe_float(
                     overview_row.get("pb") or overview_row.get("pb_ratio") or overview_row.get("P/B")
                 )
-    return {"pe": pe, "pb": pb, "roe": roe, "eps": eps}
+    # Dòng tiền: báo cáo lưu chuyển tiền tệ (KBS/VCI)
+    cf_df = _get_cash_flow_df(symbol, source)
+    if cf_df is not None:
+        cf_out = _parse_cash_flow_df(cf_df)
+        cash_flow_operating = cf_out["cash_flow_operating"]
+        cash_flow_net = cf_out["cash_flow_net"]
+    result: Dict[str, Any] = {
+        "pe": pe,
+        "pb": pb,
+        "roe": roe,
+        "eps": eps,
+    }
+    if cash_flow_operating is not None or cash_flow_net is not None:
+        result["cash_flow_operating"] = cash_flow_operating
+        result["cash_flow_net"] = cash_flow_net
+    # Khối ngoại & tự doanh (optional, cần vnstock_data)
+    flow = _get_trading_flow(symbol)
+    if flow:
+        result["trading_flow"] = {k: v for k, v in flow.items() if v is not None}
+    return result
 
 
-def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Optional[float]]:
+def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Any]:
     """Thử lần lượt nhiều nguồn vnstock cho tới khi lấy được ít nhất một chỉ số."""
-    last_item: Dict[str, Optional[float]] = {
+    last_item: Dict[str, Any] = {
         "pe": None,
         "pb": None,
         "roe": None,
