@@ -324,12 +324,26 @@ def _safe_float_list(seq: Any) -> List[float]:
     return out
 
 
+def _normalize_vnindex_prices(prices: List[float]) -> List[float]:
+    """Chuẩn hóa giá về thang VN-Index (100-5000). KBS trả nghìn (1.68=1680), Robotstock trả x50."""
+    if not prices:
+        return prices
+    mx = max(prices)
+    mn = min(prices)
+    if mx < 100 and mn > 0.1:
+        return [p * 1000.0 for p in prices]  # KBS: đơn vị nghìn
+    if mx > 5000:
+        return [p / 50.0 for p in prices]  # Robotstock: giá x50
+    return prices
+
+
 def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
     """Tính last, ma20, ma50, ma200 từ chuỗi giá VN-Index."""
     prices = _get_vnindex_close_prices(250)
     if not prices or len(prices) < 20:
         return None
 
+    prices = _normalize_vnindex_prices(prices)
     last = prices[-1]
     if last < 100 or last > 5000:
         return None
