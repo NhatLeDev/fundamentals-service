@@ -82,6 +82,38 @@ cp .env.example .env
 - **Khối ngoại & tự doanh:** `trading_flow` chỉ xuất hiện nếu cài thêm [vnstock-data](https://github.com/vuthanhdatt/vnstock-data-python) (`pip install git+https://github.com/vuthanhdatt/vnstock-data-python.git`). Gồm `foreign_net_value`, `foreign_net_volume`, `proprietary_net_value`, `proprietary_net_volume` (tổng 30 ngày gần nhất). Không cài thì phần này đánh giá ở mức tổng quát.
 - Dữ liệu cơ bản lấy từ `vnstock`: `Finance(symbol, source=...).ratio(period='year')`, `Finance(...).cash_flow(period='year')` và `Company(...).overview()`.
 
+### POST `/api/moneyflow`
+
+Endpoint frontend của bạn đang gọi để lấy dữ liệu **khối ngoại & tự doanh** theo dạng mua/bán.
+
+**Request:**
+
+```json
+{
+  "tickers": ["SSI", "MBB"],
+  "days": 30
+}
+```
+
+**Response:**
+
+```json
+{
+  "data": {
+    "SSI": {
+      "foreignBuy": 0,
+      "foreignSell": 0,
+      "proprietaryBuy": 0,
+      "proprietarySell": 0
+    }
+  }
+}
+```
+
+Ghi chú:
+- Dữ liệu khối ngoại/tự doanh cần cài [vnstock-data](https://github.com/vuthanhdatt/vnstock-data-python) (`pip install git+https://github.com/vuthanhdatt/vnstock-data-python.git`).
+- `foreignBuy/foreignSell` là **giá trị mua/bán** tổng theo cửa sổ `days` (tính trong `Trading.foreign_trade()`), tương tự cho `proprietaryBuy/proprietarySell` (tính trong `Trading.prop_trade()`).
+
 ### GET `/api/vnindex-overview`
 
 Trả về tổng quan VN-Index: giá đóng cửa gần nhất và MA(20/50/200) để đánh giá xu hướng thị trường.

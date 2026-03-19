@@ -61,6 +61,11 @@ app.add_middleware(
 class FundamentalsRequest(BaseModel):
     tickers: List[str] = []
 
+class MoneyflowRequest(BaseModel):
+    tickers: List[str] = []
+    # Số ngày gần nhất để tổng hợp giao dịch khối ngoại/tự doanh
+    days: Optional[int] = 30
+
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
 _RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
 SOURCES = [s.strip() for s in _RAW_SOURCES.split(",") if s.strip()]
@@ -231,6 +236,90 @@ def _get_trading_flow(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
         return out if out else None
+    except Exception:
+        return None
+
+
+def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[float]]]:
+    """
+    Lấy khối ngoại/tự doanh (mua/bán) trên một cửa sổ ngày gần nhất.
+
+    Response fields:
+      - foreignBuy, foreignSell (giá trị mua/bán ròng theo NĐTNN)
+      - proprietaryBuy, proprietarySell (giá trị mua/bán theo tự doanh)
+    """
+    if _Trading is None:
+        return None
+
+    try:
+        from datetime import date, timedelta
+
+        end_d = date.today()
+        start_d = end_d - timedelta(days=days)
+        start_str = start_d.strftime("%Y-%m-%d")
+        end_str = end_d.strftime("%Y-%m-%d")
+        trading = _Trading(symbol=symbol, source="vci")
+
+        out: Dict[str, Optional[float]] = {
+            "foreignBuy": None,
+            "foreignSell": None,
+            "proprietaryBuy": None,
+            "proprietarySell": None,
+        }
+
+        # Khối ngoại
+        fr_df = None
+        try:
+            fr_df = trading.foreign_trade(start=start_str, end=end_str)
+        except Exception:
+            fr_df = None
+
+        if fr_df is not None and not (hasattr(fr_df, "empty") and fr_df.empty):
+            if hasattr(fr_df, "columns"):
+                if "fr_buy_value" in fr_df.columns:
+                    out["foreignBuy"] = _safe_float(fr_df["fr_buy_value"].sum())
+                if "fr_sell_value" in fr_df.columns:
+                    out["foreignSell"] = _safe_float(fr_df["fr_sell_value"].sum())
+            elif isinstance(fr_df, dict):
+                out["foreignBuy"] = _safe_float(fr_df.get("fr_buy_value"))
+                out["foreignSell"] = _safe_float(fr_df.get("fr_sell_value"))
+
+        # Tự doanh
+        prop_df = None
+        try:
+            prop_df = trading.prop_trade(start=start_str, end=end_str, resolution="1D")
+        except Exception:
+            prop_df = None
+
+        if prop_df is not None and not (hasattr(prop_df, "empty") and prop_df.empty):
+            # Ưu tiên cột tổng hợp theo "trade_value" (theo doc demo)
+            buy_candidates = ("total_buy_trade_value", "total_deal_buy_trade_value")
+            sell_candidates = ("total_sell_trade_value", "total_deal_sell_trade_value")
+
+            if hasattr(prop_df, "columns"):
+                for col in buy_candidates:
+                    if col in prop_df.columns:
+                        out["proprietaryBuy"] = _safe_float(prop_df[col].sum())
+                        break
+                for col in sell_candidates:
+                    if col in prop_df.columns:
+                        out["proprietarySell"] = _safe_float(prop_df[col].sum())
+                        break
+            elif isinstance(prop_df, dict):
+                for col in buy_candidates:
+                    v = prop_df.get(col)
+                    if v is not None:
+                        out["proprietaryBuy"] = _safe_float(v)
+                        break
+                for col in sell_candidates:
+                    v = prop_df.get(col)
+                    if v is not None:
+                        out["proprietarySell"] = _safe_float(v)
+                        break
+
+        if any(v is not None for v in out.values()):
+            return out
+        return None
     except Exception:
         return None
 
@@ -517,6 +606,44 @@ def api_vnindex_overview():
     return JSONResponse(content=result)
 
 
+@app.post("/api/moneyflow")
+def api_moneyflow(req: MoneyflowRequest):
+    """
+    POST /api/moneyflow
+
+    Request body:
+      { "tickers": ["SSI", "MBB"], "days": 30 }
+
+    Response:
+      { "data": { "SSI": {
+          "foreignBuy": number,
+          "foreignSell": number,
+          "proprietaryBuy": number,
+          "proprietarySell": number
+      }, ... } }
+    """
+    tickers = req.tickers or []
+    days = req.days if req.days is not None else 30
+    try:
+        days_int = int(days)
+    except Exception:
+        days_int = 30
+    days_int = days_int if days_int > 0 else 30
+
+    unique = list({str(t).strip().upper() for t in tickers if t})
+    data: Dict[str, Dict[str, Optional[float]]] = {}
+
+    for symbol in unique:
+        try:
+            mf = _get_moneyflow(symbol, days=days_int)
+            if mf and any(v is not None for v in mf.values()):
+                data[symbol] = mf
+        except Exception:
+            continue
+
+    return JSONResponse(content={"data": data})
+
+
 @app.post("/api/fundamentals")
 @app.post("/fundamentals")
 @app.post("/")
@@ -556,20 +683,44 @@ class handler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length).decode("utf-8") if content_length else "{}"
             payload = json.loads(body) if body.strip() else {}
             tickers = payload.get("tickers") or []
+            days = payload.get("days", 30)
         except Exception:
             tickers = []
+            days = 30
 
         unique = list({str(t).strip().upper() for t in tickers if t})
-        data: Dict[str, Dict[str, Optional[float]]] = {}
-        for symbol in unique:
-            try:
-                item = _extract_for_sources(symbol, SOURCES)
-                if any(x is not None for x in item.values()):
-                    data[symbol] = item
-            except Exception:
-                continue
+        path = (getattr(self, "path", "") or "").lower()
 
-        out = json.dumps({"data": data}, ensure_ascii=False)
+        # Vercel/compat mode: hỗ trợ thêm /api/moneyflow
+        if "api/moneyflow" in path:
+            try:
+                days_int = int(days)
+            except Exception:
+                days_int = 30
+            days_int = days_int if days_int > 0 else 30
+
+            moneyflow: Dict[str, Dict[str, Optional[float]]] = {}
+            for symbol in unique:
+                try:
+                    mf = _get_moneyflow(symbol, days=days_int)
+                    if mf and any(v is not None for v in mf.values()):
+                        moneyflow[symbol] = mf
+                except Exception:
+                    continue
+
+            out = json.dumps({"data": moneyflow}, ensure_ascii=False)
+        else:
+            data: Dict[str, Dict[str, Optional[float]]] = {}
+            for symbol in unique:
+                try:
+                    item = _extract_for_sources(symbol, SOURCES)
+                    if any(x is not None for x in item.values()):
+                        data[symbol] = item
+                except Exception:
+                    continue
+
+            out = json.dumps({"data": data}, ensure_ascii=False)
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
