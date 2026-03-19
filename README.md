@@ -63,6 +63,8 @@ cp .env.example .env
       "pb": 1.02,
       "roe": 18.5,
       "eps": 3500,
+      "volume_ma20": 1245000.25,
+      "volume_ma50": 1189000.5,
       "cash_flow_operating": 1234567890000,
       "cash_flow_net": 500000000000,
       "trading_flow": {
@@ -78,6 +80,7 @@ cp .env.example .env
 ```
 
 - Mã không lấy được sẽ không có trong `data`.
+- **Volume MA:** `volume_ma20`, `volume_ma50` được tính từ lịch sử khối lượng giao dịch ngày (`Quote.history(..., interval="1D")`).
 - **Dòng tiền (cash flow):** `cash_flow_operating` (lưu chuyển tiền từ hoạt động kinh doanh), `cash_flow_net` (tăng/giảm tiền thuần) từ `Finance(...).cash_flow(period='year')` (KBS/VCI). Có thể thiếu nếu nguồn không trả về.
 - **Khối ngoại & tự doanh:** `trading_flow` chỉ xuất hiện nếu cài thêm [vnstock-data](https://github.com/vuthanhdatt/vnstock-data-python) (`pip install git+https://github.com/vuthanhdatt/vnstock-data-python.git`). Gồm `foreign_net_value`, `foreign_net_volume`, `proprietary_net_value`, `proprietary_net_volume` (tổng 30 ngày gần nhất). Không cài thì phần này đánh giá ở mức tổng quát.
 - Dữ liệu cơ bản lấy từ `vnstock`: `Finance(symbol, source=...).ratio(period='year')`, `Finance(...).cash_flow(period='year')` và `Company(...).overview()`.

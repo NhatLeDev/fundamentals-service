@@ -356,6 +356,7 @@ def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
 def _extract(symbol: str, source: str) -> Dict[str, Any]:
     pe = pb = roe = eps = None
     cash_flow_operating = cash_flow_net = None
+    volume_ma20 = volume_ma50 = None
     df = _get_ratio_df(symbol, source)
     if df is not None:
         out = _parse_ratio_df(df)
@@ -390,6 +391,15 @@ def _extract(symbol: str, source: str) -> Dict[str, Any]:
     flow = _get_trading_flow(symbol)
     if flow:
         result["trading_flow"] = {k: v for k, v in flow.items() if v is not None}
+    # Volume MA20/MA50 từ lịch sử khối lượng giao dịch
+    volume_ma = _get_symbol_volume_ma(symbol, preferred_source=source)
+    if volume_ma:
+        volume_ma20 = volume_ma.get("volume_ma20")
+        volume_ma50 = volume_ma.get("volume_ma50")
+    if volume_ma20 is not None:
+        result["volume_ma20"] = volume_ma20
+    if volume_ma50 is not None:
+        result["volume_ma50"] = volume_ma50
     return result
 
 
@@ -407,6 +417,59 @@ def _extract_for_sources(symbol: str, sources: List[str]) -> Dict[str, Any]:
             return item
         last_item = item
     return last_item
+
+
+def _get_symbol_volume_ma(symbol: str, preferred_source: str, days: int = 120) -> Optional[Dict[str, float]]:
+    """
+    Tính MA20/MA50 khối lượng giao dịch cho một mã.
+    Trả về: {"volume_ma20": ..., "volume_ma50": ...}
+    """
+    if Quote is None:
+        return None
+
+    src_candidates = [preferred_source, "KBS", "TCBS", "DNSE", "VCI"]
+    tried: List[str] = []
+    sources = []
+    for s in src_candidates:
+        ss = str(s or "").strip()
+        if not ss or ss in tried:
+            continue
+        tried.append(ss)
+        sources.append(ss)
+
+    def _extract_volume(df) -> Optional[List[float]]:
+        if df is None or (hasattr(df, "empty") and df.empty) or len(df) == 0:
+            return None
+        for col_name in ("volume", "Volume"):
+            col = None
+            if hasattr(df, "columns") and col_name in df.columns:
+                col = df[col_name]
+            elif hasattr(df, col_name):
+                col = getattr(df, col_name)
+            if col is not None:
+                vols = _safe_float_list(col)
+                if len(vols) >= 50:
+                    return vols[-days:] if len(vols) > days else vols
+        return None
+
+    for src in sources:
+        try:
+            quote = Quote(symbol=symbol, source=src)
+            df = quote.history(length="1Y", interval="1D")
+            vols = _extract_volume(df)
+            if not vols:
+                continue
+            if len(vols) < 50:
+                continue
+            ma20 = sum(vols[-20:]) / 20.0
+            ma50 = sum(vols[-50:]) / 50.0
+            return {
+                "volume_ma20": round(ma20, 2),
+                "volume_ma50": round(ma50, 2),
+            }
+        except Exception:
+            continue
+    return None
 
 
 def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
