@@ -32,7 +32,11 @@ _Trading = None
 try:
     from vnstock_data import Trading as _Trading
 except Exception:
-    pass
+    # Fallback: một số bản vnstock expose Trading trực tiếp
+    try:
+        from vnstock import Trading as _Trading
+    except Exception:
+        pass
 
 # VN-Index: thử nhiều API vnstock (Quote, stock_historical_data, get_index_series)
 try:
@@ -248,8 +252,18 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
       - foreignBuy, foreignSell (giá trị mua/bán ròng theo NĐTNN)
       - proprietaryBuy, proprietarySell (giá trị mua/bán theo tự doanh)
     """
+    out: Dict[str, Optional[float]] = {
+        "foreignBuy": None,
+        "foreignSell": None,
+        "proprietaryBuy": None,
+        "proprietarySell": None,
+        # Room ngoại
+        "foreignRoomCurrent": None,
+        "foreignRoomTotal": None,
+        "foreignOwnership": None,
+    }
     if _Trading is None:
-        return None
+        return out
 
     try:
         from datetime import date, timedelta
@@ -259,13 +273,6 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
         start_str = start_d.strftime("%Y-%m-%d")
         end_str = end_d.strftime("%Y-%m-%d")
         trading = _Trading(symbol=symbol, source="vci")
-
-        out: Dict[str, Optional[float]] = {
-            "foreignBuy": None,
-            "foreignSell": None,
-            "proprietaryBuy": None,
-            "proprietarySell": None,
-        }
 
         # Khối ngoại
         fr_df = None
@@ -280,9 +287,18 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
                     out["foreignBuy"] = _safe_float(fr_df["fr_buy_value"].sum())
                 if "fr_sell_value" in fr_df.columns:
                     out["foreignSell"] = _safe_float(fr_df["fr_sell_value"].sum())
+                if "fr_current_room" in fr_df.columns:
+                    out["foreignRoomCurrent"] = _safe_float(fr_df["fr_current_room"].iloc[-1])
+                if "fr_total_room" in fr_df.columns:
+                    out["foreignRoomTotal"] = _safe_float(fr_df["fr_total_room"].iloc[-1])
+                if "fr_ownership" in fr_df.columns:
+                    out["foreignOwnership"] = _safe_float(fr_df["fr_ownership"].iloc[-1])
             elif isinstance(fr_df, dict):
                 out["foreignBuy"] = _safe_float(fr_df.get("fr_buy_value"))
                 out["foreignSell"] = _safe_float(fr_df.get("fr_sell_value"))
+                out["foreignRoomCurrent"] = _safe_float(fr_df.get("fr_current_room"))
+                out["foreignRoomTotal"] = _safe_float(fr_df.get("fr_total_room"))
+                out["foreignOwnership"] = _safe_float(fr_df.get("fr_ownership"))
 
         # Tự doanh
         prop_df = None
@@ -317,11 +333,9 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
                         out["proprietarySell"] = _safe_float(v)
                         break
 
-        if any(v is not None for v in out.values()):
-            return out
-        return None
+        return out
     except Exception:
-        return None
+        return out
 
 
 def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
@@ -607,6 +621,7 @@ def api_vnindex_overview():
 
 
 @app.post("/api/moneyflow")
+@app.post("/moneyflow")
 def api_moneyflow(req: MoneyflowRequest):
     """
     POST /api/moneyflow
@@ -636,10 +651,25 @@ def api_moneyflow(req: MoneyflowRequest):
     for symbol in unique:
         try:
             mf = _get_moneyflow(symbol, days=days_int)
-            if mf and any(v is not None for v in mf.values()):
-                data[symbol] = mf
+            data[symbol] = mf or {
+                "foreignBuy": None,
+                "foreignSell": None,
+                "proprietaryBuy": None,
+                "proprietarySell": None,
+                "foreignRoomCurrent": None,
+                "foreignRoomTotal": None,
+                "foreignOwnership": None,
+            }
         except Exception:
-            continue
+            data[symbol] = {
+                "foreignBuy": None,
+                "foreignSell": None,
+                "proprietaryBuy": None,
+                "proprietarySell": None,
+                "foreignRoomCurrent": None,
+                "foreignRoomTotal": None,
+                "foreignOwnership": None,
+            }
 
     return JSONResponse(content={"data": data})
 
@@ -691,8 +721,8 @@ class handler(BaseHTTPRequestHandler):
         unique = list({str(t).strip().upper() for t in tickers if t})
         path = (getattr(self, "path", "") or "").lower()
 
-        # Vercel/compat mode: hỗ trợ thêm /api/moneyflow
-        if "api/moneyflow" in path:
+        # Vercel/compat mode: hỗ trợ /api/moneyflow và /moneyflow
+        if "moneyflow" in path:
             try:
                 days_int = int(days)
             except Exception:
@@ -703,10 +733,25 @@ class handler(BaseHTTPRequestHandler):
             for symbol in unique:
                 try:
                     mf = _get_moneyflow(symbol, days=days_int)
-                    if mf and any(v is not None for v in mf.values()):
-                        moneyflow[symbol] = mf
+                    moneyflow[symbol] = mf or {
+                        "foreignBuy": None,
+                        "foreignSell": None,
+                        "proprietaryBuy": None,
+                        "proprietarySell": None,
+                        "foreignRoomCurrent": None,
+                        "foreignRoomTotal": None,
+                        "foreignOwnership": None,
+                    }
                 except Exception:
-                    continue
+                    moneyflow[symbol] = {
+                        "foreignBuy": None,
+                        "foreignSell": None,
+                        "proprietaryBuy": None,
+                        "proprietarySell": None,
+                        "foreignRoomCurrent": None,
+                        "foreignRoomTotal": None,
+                        "foreignOwnership": None,
+                    }
 
             out = json.dumps({"data": moneyflow}, ensure_ascii=False)
         else:

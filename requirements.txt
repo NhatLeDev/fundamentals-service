@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30.0
 vnstock>=3.4.0
 pandas>=2.0.0
 pytz>=2024.1
+git+https://github.com/vuthanhdatt/vnstock-data-python.git

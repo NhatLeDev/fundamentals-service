@@ -137,7 +137,12 @@ Trả về tổng quan VN-Index: giá đóng cửa gần nhất và MA(20/50/200
 Trong `.env` của project Next.js:
 
 ```bash
-FUNDAMENTALS_API_URL=http://localhost:8001/fundamentals
+FUNDAMENTALS_API_URL=http://localhost:8001
 ```
 
-Khi có biến này, `fetchFundamentalsForTickers` trong `market-api.ts` sẽ gọi sang service và đưa dữ liệu vào prompt Gemini.
+Lưu ý:
+- Nếu frontend ghép path kiểu `FUNDAMENTALS_API_URL + /api/moneyflow` thì biến phải là **base URL** như trên (không thêm `/fundamentals`).
+- Service hỗ trợ cả:
+  - `POST /api/fundamentals` (khuyến nghị)
+  - `POST /fundamentals`
+  - `POST /api/moneyflow` (khối ngoại/tự doanh + room ngoại)
