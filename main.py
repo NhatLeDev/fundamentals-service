@@ -272,21 +272,48 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
         start_d = end_d - timedelta(days=days)
         start_str = start_d.strftime("%Y-%m-%d")
         end_str = end_d.strftime("%Y-%m-%d")
-        trading = _Trading(symbol=symbol, source="vci")
+        
+        # Try multiple sources if VCI fails
+        sources = ["vci", "tcbs", "ssi"]
+        trading = None
+        
+        for src in sources:
+            try:
+                trading = _Trading(symbol=symbol, source=src)
+                break
+            except Exception:
+                continue
+        
+        if trading is None:
+            return out
 
         # Khối ngoại
         fr_df = None
         try:
             fr_df = trading.foreign_trade(start=start_str, end=end_str)
-        except Exception:
-            fr_df = None
+        except Exception as e:
+            # Try alternative method if available
+            try:
+                fr_df = trading.foreign_trading(start=start_str, end=end_str)
+            except Exception:
+                fr_df = None
 
         if fr_df is not None and not (hasattr(fr_df, "empty") and fr_df.empty):
             if hasattr(fr_df, "columns"):
-                if "fr_buy_value" in fr_df.columns:
-                    out["foreignBuy"] = _safe_float(fr_df["fr_buy_value"].sum())
-                if "fr_sell_value" in fr_df.columns:
-                    out["foreignSell"] = _safe_float(fr_df["fr_sell_value"].sum())
+                # Try multiple column name variations
+                buy_cols = ["fr_buy_value", "foreign_buy_value", "buy_value"]
+                sell_cols = ["fr_sell_value", "foreign_sell_value", "sell_value"]
+                
+                for col in buy_cols:
+                    if col in fr_df.columns:
+                        out["foreignBuy"] = _safe_float(fr_df[col].sum())
+                        break
+                
+                for col in sell_cols:
+                    if col in fr_df.columns:
+                        out["foreignSell"] = _safe_float(fr_df[col].sum())
+                        break
+                
                 if "fr_current_room" in fr_df.columns:
                     out["foreignRoomCurrent"] = _safe_float(fr_df["fr_current_room"].iloc[-1])
                 if "fr_total_room" in fr_df.columns:
@@ -294,8 +321,8 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
                 if "fr_ownership" in fr_df.columns:
                     out["foreignOwnership"] = _safe_float(fr_df["fr_ownership"].iloc[-1])
             elif isinstance(fr_df, dict):
-                out["foreignBuy"] = _safe_float(fr_df.get("fr_buy_value"))
-                out["foreignSell"] = _safe_float(fr_df.get("fr_sell_value"))
+                out["foreignBuy"] = _safe_float(fr_df.get("fr_buy_value") or fr_df.get("foreign_buy_value"))
+                out["foreignSell"] = _safe_float(fr_df.get("fr_sell_value") or fr_df.get("foreign_sell_value"))
                 out["foreignRoomCurrent"] = _safe_float(fr_df.get("fr_current_room"))
                 out["foreignRoomTotal"] = _safe_float(fr_df.get("fr_total_room"))
                 out["foreignOwnership"] = _safe_float(fr_df.get("fr_ownership"))
@@ -305,12 +332,16 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
         try:
             prop_df = trading.prop_trade(start=start_str, end=end_str, resolution="1D")
         except Exception:
-            prop_df = None
+            # Try alternative method
+            try:
+                prop_df = trading.proprietary_trade(start=start_str, end=end_str)
+            except Exception:
+                prop_df = None
 
         if prop_df is not None and not (hasattr(prop_df, "empty") and prop_df.empty):
             # Ưu tiên cột tổng hợp theo "trade_value" (theo doc demo)
-            buy_candidates = ("total_buy_trade_value", "total_deal_buy_trade_value")
-            sell_candidates = ("total_sell_trade_value", "total_deal_sell_trade_value")
+            buy_candidates = ("total_buy_trade_value", "total_deal_buy_trade_value", "buy_value", "prop_buy_value")
+            sell_candidates = ("total_sell_trade_value", "total_deal_sell_trade_value", "sell_value", "prop_sell_value")
 
             if hasattr(prop_df, "columns"):
                 for col in buy_candidates:
@@ -670,6 +701,21 @@ def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
     }
 
 
+@app.get("/health")
+@app.get("/api/health")
+def health_check():
+    """Health check endpoint for monitoring service status."""
+    from datetime import datetime
+    return JSONResponse(content={
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "service": "fundamentals-api",
+        "version": "1.0.0",
+        "vnstock_available": True,
+        "trading_available": _Trading is not None,
+    })
+
+
 @app.get("/api/vnindex-overview")
 @app.get("/vnindex-overview")
 def api_vnindex_overview():
@@ -710,6 +756,13 @@ def api_moneyflow(req: MoneyflowRequest):
 
     unique = list({str(t).strip().upper() for t in tickers if t})
     data: Dict[str, Dict[str, Optional[float]]] = {}
+    
+    # Add metadata for debugging
+    metadata = {
+        "requested_tickers": unique,
+        "days": days_int,
+        "trading_available": _Trading is not None,
+    }
 
     for symbol in unique:
         try:
@@ -723,7 +776,9 @@ def api_moneyflow(req: MoneyflowRequest):
                 "foreignRoomTotal": None,
                 "foreignOwnership": None,
             }
-        except Exception:
+        except Exception as e:
+            # Log error but continue with other symbols
+            print(f"Error fetching moneyflow for {symbol}: {str(e)}")
             data[symbol] = {
                 "foreignBuy": None,
                 "foreignSell": None,
@@ -734,7 +789,7 @@ def api_moneyflow(req: MoneyflowRequest):
                 "foreignOwnership": None,
             }
 
-    return JSONResponse(content={"data": data})
+    return JSONResponse(content={"data": data, "_debug": metadata})
 
 
 @app.post("/api/fundamentals")
