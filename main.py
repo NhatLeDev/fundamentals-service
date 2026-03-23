@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +52,44 @@ try:
     from vnstock import get_index_series
 except ImportError:
     get_index_series = None
+try:
+    from vnstock import Listing
+except ImportError:
+    Listing = None
+
+# Danh sách dự phòng khi VCI/Listing không gọi được (VN30 đổi định kỳ — ưu tiên API).
+_VN30_FALLBACK_SYMBOLS = (
+    "ACB",
+    "BCM",
+    "BID",
+    "BVH",
+    "CTG",
+    "FPT",
+    "GAS",
+    "GVR",
+    "HDB",
+    "HPG",
+    "KDH",
+    "MBB",
+    "MSN",
+    "MWG",
+    "NVL",
+    "PDR",
+    "PLX",
+    "POW",
+    "SAB",
+    "SSI",
+    "STB",
+    "TCB",
+    "TPB",
+    "VCB",
+    "VHM",
+    "VIC",
+    "VJC",
+    "VNM",
+    "VPB",
+    "VRE",
+)
 
 app = FastAPI(title="Fundamentals API")
 app.add_middleware(
@@ -503,49 +542,63 @@ def _get_symbol_volume_ma(symbol: str, preferred_source: str, days: int = 120) -
     return None
 
 
-def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
-    """Lấy chuỗi giá đóng cửa VN-Index. KBS hoạt động trên cloud (Render); VCI có thể bị chặn."""
+def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
+    """Chuỗi nến daily VN-Index (cũ → mới): close, volume (0 nếu nguồn không có)."""
     if days <= 0:
-        days = 250
+        days = 260
 
-    def _extract_close(df) -> Optional[List[float]]:
+    def _bars_from_df(df) -> Optional[List[Dict[str, float]]]:
         if df is None or (hasattr(df, "empty") and df.empty) or len(df) == 0:
             return None
-        col_names = ("close", "Close", "indexValue", "index_value")
-        for col_name in col_names:
-            col = None
+        close_series = None
+        for col_name in ("close", "Close", "indexValue", "index_value"):
             if hasattr(df, "columns") and col_name in df.columns:
-                col = df[col_name]
-            elif hasattr(df, col_name):
-                col = getattr(df, col_name)
-            if col is not None:
-                prices = _safe_float_list(col)
-                if len(prices) >= 20:
-                    return prices[-days:] if len(prices) > days else prices
-        return None
+                close_series = df[col_name]
+                break
+        if close_series is None:
+            return None
+        closes = _safe_float_list(close_series)
+        if len(closes) < 20:
+            return None
+        vol_series = None
+        for col_name in ("volume", "Volume", "totalVolume", "total_volume"):
+            if hasattr(df, "columns") and col_name in df.columns:
+                vol_series = df[col_name]
+                break
+        if vol_series is None:
+            vols = [0.0] * len(closes)
+        else:
+            vols = _safe_float_list(vol_series)
+            if len(vols) != len(closes):
+                vols = [0.0] * len(closes)
+        out = [{"close": closes[i], "volume": vols[i]} for i in range(len(closes))]
+        return out[-days:] if len(out) > days else out
 
     # 1) Quote.history - KBS/TCBS/DNSE (cloud), VCI (có thể bị chặn)
     if Quote is not None:
         for source in ("KBS", "TCBS", "DNSE", "VCI"):
             try:
                 quote = Quote(symbol="VNINDEX", source=source)
-                # length="1Y" ~ 252 phiên, đủ MA200
                 df = quote.history(length="1Y", interval="1D")
-                prices = _extract_close(df)
-                if prices:
-                    return prices
+                bars = _bars_from_df(df)
+                if bars:
+                    return bars
             except Exception:
                 continue
-        # Thử start/end nếu length không được hỗ trợ
         try:
             from datetime import date, timedelta
+
             end_d = date.today()
             start_d = end_d - timedelta(days=days * 2)
             quote = Quote(symbol="VNINDEX", source="KBS")
-            df = quote.history(start=start_d.strftime("%Y-%m-%d"), end=end_d.strftime("%Y-%m-%d"), interval="1D")
-            prices = _extract_close(df)
-            if prices:
-                return prices
+            df = quote.history(
+                start=start_d.strftime("%Y-%m-%d"),
+                end=end_d.strftime("%Y-%m-%d"),
+                interval="1D",
+            )
+            bars = _bars_from_df(df)
+            if bars:
+                return bars
         except Exception:
             pass
 
@@ -553,9 +606,9 @@ def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
     if get_index_series is not None:
         try:
             df = get_index_series(index_code="VNINDEX", time_range="OneYear")
-            prices = _extract_close(df)
-            if prices:
-                return prices
+            bars = _bars_from_df(df)
+            if bars:
+                return bars
         except Exception:
             pass
 
@@ -563,6 +616,7 @@ def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
     if stock_historical_data is not None:
         try:
             from datetime import date, timedelta
+
             end_d = date.today()
             start_d = end_d - timedelta(days=days * 2)
             start_str = start_d.strftime("%Y-%m-%d")
@@ -573,74 +627,102 @@ def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
             ]:
                 try:
                     df = stock_historical_data(**kwargs)
-                    prices = _extract_close(df)
-                    if prices:
-                        return prices
+                    bars = _bars_from_df(df)
+                    if bars:
+                        return bars
                 except TypeError:
                     try:
                         df = stock_historical_data("VNINDEX", start_str, end_str)
-                        prices = _extract_close(df)
-                        if prices:
-                            return prices
+                        bars = _bars_from_df(df)
+                        if bars:
+                            return bars
                     except Exception:
                         pass
         except Exception:
             pass
 
-    # 4) Fallback: Robotstock API (miễn phí 50 req/ngày, hoạt động từ server)
+    # 4) Robotstock
     try:
         import urllib.request
+
         rkey = os.environ.get("ROBOTSTOCK_API_KEY", "demo")
         url = f"https://api.robotstock.info.vn/api_data?type=his_stock&sym=VNINDEX&key={rkey}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"}
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             import json as _json
+
             rows = _json.loads(resp.read().decode())
         if isinstance(rows, list) and len(rows) >= 20:
-            # Sắp xếp theo Date (YYYYMMDD), lấy Close. Robotstock trả giá * 50 (vd: 62975 = 1259.5)
-            sorted_rows = sorted(rows, key=lambda r: r.get("Date", ""), reverse=True)
-            prices = []
+            sorted_rows = sorted(rows, key=lambda r: r.get("Date", ""))
+            bars_rs: List[Dict[str, float]] = []
             for r in sorted_rows:
                 c = r.get("Close") or r.get("close")
-                if c is not None:
-                    try:
-                        v = float(c)
-                        if v > 0 and v < 1e15:
-                            prices.append(v)
-                    except (TypeError, ValueError):
-                        pass
-            if len(prices) >= 20:
-                prices = list(reversed(prices))  # cũ nhất -> mới nhất
-                # Chuẩn hóa: nếu giá > 5000 thì chia 50 (format Robotstock)
-                if max(prices) > 5000:
-                    prices = [p / 50.0 for p in prices]
-                return prices[-days:] if len(prices) > days else prices
+                vol_raw = r.get("Volume") or r.get("volume") or r.get("Vol") or 0
+                if c is None:
+                    continue
+                try:
+                    close_v = float(c)
+                    vol_v = float(vol_raw) if vol_raw not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    continue
+                if close_v > 0 and close_v < 1e15:
+                    bars_rs.append({"close": close_v, "volume": vol_v})
+            if len(bars_rs) >= 20:
+                if max(b["close"] for b in bars_rs) > 5000:
+                    for b in bars_rs:
+                        b["close"] /= 50.0
+                return bars_rs[-days:] if len(bars_rs) > days else bars_rs
     except Exception:
         pass
 
-    # 5) Fallback: Yahoo Finance (^VNINDEX hoặc VNINDEX.VN)
+    # 5) Yahoo Finance
     for yahoo_symbol in ("%5EVNINDEX", "VNINDEX.VN"):
         try:
             import urllib.request
+
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1d&range=1y"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; Vnstock/1.0)"})
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0 (compatible; Vnstock/1.0)"}
+            )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 import json as _json
+
                 data = _json.loads(resp.read().decode())
             results = data.get("chart", {}).get("result") or []
             if not results:
                 continue
             quote = results[0].get("indicators", {}).get("quote") or [{}]
-            closes = quote[0].get("close") if quote else []
-            if not closes:
+            q0 = quote[0] if quote else {}
+            closes_raw = q0.get("close") or []
+            vols_raw = q0.get("volume") or []
+            if not closes_raw:
                 continue
-            prices = [float(c) for c in closes if c is not None and isinstance(c, (int, float))]
-            if len(prices) >= 20:
-                return prices[-days:] if len(prices) > days else prices
+            bars_y: List[Dict[str, float]] = []
+            for i, c in enumerate(closes_raw):
+                if c is None or not isinstance(c, (int, float)):
+                    continue
+                vv = (
+                    float(vols_raw[i])
+                    if i < len(vols_raw) and isinstance(vols_raw[i], (int, float))
+                    else 0.0
+                )
+                bars_y.append({"close": float(c), "volume": vv})
+            if len(bars_y) >= 20:
+                return bars_y[-days:] if len(bars_y) > days else bars_y
         except Exception:
             continue
 
     return None
+
+
+def _get_vnindex_close_prices(days: int = 250) -> Optional[List[float]]:
+    """Lấy chuỗi giá đóng cửa VN-Index. KBS hoạt động trên cloud (Render); VCI có thể bị chặn."""
+    bars = _get_vnindex_bars(days)
+    if not bars:
+        return None
+    return [b["close"] for b in bars]
 
 
 def _safe_float_list(seq: Any) -> List[float]:
@@ -674,13 +756,197 @@ def _normalize_vnindex_prices(prices: List[float]) -> List[float]:
     return prices
 
 
+def _normalize_vnindex_bars(bars: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    closes = [b["close"] for b in bars]
+    closes_n = _normalize_vnindex_prices(closes)
+    return [
+        {"close": closes_n[i], "volume": bars[i]["volume"]}
+        for i in range(len(bars))
+    ]
+
+
+def _compute_rsi14(closes: List[float]) -> Optional[float]:
+    period = 14
+    if len(closes) < period + 1:
+        return None
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss <= 1e-12:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(rsi, 2)
+
+
+def _ma200_streak_sessions(closes: List[float]) -> Dict[str, Any]:
+    """
+    Đếm số phiên liên tiếp gần nhất đóng cửa dưới / trên MA200 (MA200 rolling theo từng phiên).
+    Trả về streak_below, streak_above (một trong hai = 0).
+    """
+    n = len(closes)
+    below = 0
+    above = 0
+    for j in range(n - 1, -1, -1):
+        hist = closes[: j + 1]
+        if len(hist) < 200:
+            break
+        ma200_j = sum(hist[-200:]) / 200.0
+        cj = closes[j]
+        if cj < ma200_j:
+            if above > 0:
+                break
+            below += 1
+        elif cj > ma200_j:
+            if below > 0:
+                break
+            above += 1
+        else:
+            break
+    return {"streak_below_ma200": below, "streak_above_ma200": above}
+
+
+def _build_market_phase_label(
+    last: float,
+    ma20_val: Optional[float],
+    ma50_val: Optional[float],
+    ma200_val: Optional[float],
+    streak_below: int,
+    streak_above: int,
+) -> str:
+    parts: List[str] = []
+    if ma200_val is not None:
+        if last < ma200_val:
+            parts.append("DOWNTREND (giá dưới MA200)")
+        elif last > ma200_val:
+            parts.append("UPTREND (giá trên MA200)")
+        else:
+            parts.append("Giá tại MA200 (điểm cân bằng)")
+    else:
+        parts.append("Pha thị trường: MA200 chưa đủ dữ liệu")
+
+    if ma20_val is not None and ma50_val is not None and ma200_val is not None:
+        if ma20_val > ma50_val > ma200_val and last > ma200_val:
+            parts.append("cấu trúc MA20>MA50>MA200")
+        elif ma20_val < ma50_val < ma200_val and last < ma200_val:
+            parts.append("cấu trúc MA20<MA50<MA200")
+
+    if streak_below > 0:
+        parts.append(f"— Phiên thứ {streak_below} liên tiếp đóng cửa dưới MA200")
+    elif streak_above > 0:
+        parts.append(f"— Phiên thứ {streak_above} liên tiếp đóng cửa trên MA200")
+
+    return " ".join(parts)
+
+
+def _vn30_symbol_list() -> List[str]:
+    if Listing is not None:
+        try:
+            series = Listing().symbols_by_group("VN30")
+            raw = series.tolist() if hasattr(series, "tolist") else list(series)
+            out = [str(x).strip().upper() for x in raw if x]
+            out = list(dict.fromkeys(out))
+            if len(out) >= 25:
+                return out[:35]
+        except Exception:
+            pass
+    return list(_VN30_FALLBACK_SYMBOLS)
+
+
+def _get_equity_close_prices(symbol: str, days: int = 220) -> Optional[List[float]]:
+    if Quote is None:
+        return None
+    for source in ("KBS", "TCBS", "DNSE", "VCI"):
+        try:
+            quote = Quote(symbol=symbol, source=source)
+            df = quote.history(length="1Y", interval="1D")
+            if df is None or (hasattr(df, "empty") and df.empty):
+                continue
+            for col_name in ("close", "Close"):
+                if hasattr(df, "columns") and col_name in df.columns:
+                    prices = _safe_float_list(df[col_name])
+                    if len(prices) >= 200:
+                        return prices[-days:] if len(prices) > days else prices
+                    break
+        except Exception:
+            continue
+    return None
+
+
+def _vn30_one_above_ma200(sym: str) -> Optional[bool]:
+    closes = _get_equity_close_prices(sym, 220)
+    if not closes or len(closes) < 200:
+        return None
+    last_c = closes[-1]
+    ma200 = sum(closes[-200:]) / 200.0
+    return last_c > ma200
+
+
+def _compute_vn30_above_ma200_breadth() -> Dict[str, Any]:
+    symbols = _vn30_symbol_list()
+    above = 0
+    total = 0
+    failed = 0
+    workers = min(10, max(1, len(symbols)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_vn30_one_above_ma200, symbols))
+    for ok in results:
+        if ok is None:
+            failed += 1
+        else:
+            total += 1
+            if ok:
+                above += 1
+    pct: Optional[float] = None
+    if total > 0:
+        pct = round(100.0 * above / total, 2)
+    return {
+        "vn30AboveMa200Pct": pct,
+        "vn30AboveMa200Count": above,
+        "vn30BreadthSampleSize": total,
+        "vn30BreadthFailedFetch": failed,
+    }
+
+
+def _volume_today_vs_avg20(bars: List[Dict[str, float]]) -> Dict[str, Any]:
+    vols = [b.get("volume") or 0.0 for b in bars]
+    if len(vols) < 21:
+        return {
+            "volume_today": None,
+            "volume_avg20": None,
+            "volume_vs_avg20_pct": None,
+        }
+    today_v = vols[-1]
+    prev20 = vols[-21:-1]
+    avg20 = sum(prev20) / len(prev20) if prev20 else None
+    if avg20 is not None and avg20 <= 0:
+        avg20 = None
+    vs_pct: Optional[float] = None
+    if avg20 is not None and avg20 > 0 and today_v > 0:
+        vs_pct = round((today_v / avg20 - 1.0) * 100.0, 2)
+    return {
+        "volume_today": round(today_v, 2) if today_v > 0 else None,
+        "volume_avg20": round(avg20, 2) if avg20 is not None else None,
+        "volume_vs_avg20_pct": vs_pct,
+    }
+
+
 def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
-    """Tính last, ma20, ma50, ma200 từ chuỗi giá VN-Index."""
-    prices = _get_vnindex_close_prices(250)
-    if not prices or len(prices) < 20:
+    """Tính last, MA, RSI, thanh khoản, pha thị trường, breadth VN30/MA200."""
+    bars = _get_vnindex_bars(260)
+    if not bars or len(bars) < 20:
         return None
 
-    prices = _normalize_vnindex_prices(prices)
+    bars = _normalize_vnindex_bars(bars)
+    prices = [b["close"] for b in bars]
     last = prices[-1]
     if last < 100 or last > 5000:
         return None
@@ -693,12 +959,41 @@ def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
     ma20_val = sma(prices, 20)
     ma50_val = sma(prices, 50)
     ma200_val = sma(prices, 200)
-    return {
+    rsi14 = _compute_rsi14(prices)
+    streak_info = _ma200_streak_sessions(prices)
+    sb = int(streak_info["streak_below_ma200"])
+    sa = int(streak_info["streak_above_ma200"])
+    phase_label = _build_market_phase_label(
+        last, ma20_val, ma50_val, ma200_val, sb, sa
+    )
+    vol_info = _volume_today_vs_avg20(bars)
+
+    breadth: Dict[str, Any] = {}
+    try:
+        breadth = _compute_vn30_above_ma200_breadth()
+    except Exception:
+        breadth = {
+            "vn30AboveMa200Pct": None,
+            "vn30AboveMa200Count": None,
+            "vn30BreadthSampleSize": None,
+            "vn30BreadthFailedFetch": None,
+        }
+
+    out: Dict[str, Any] = {
         "last": round(last, 2),
         "ma20": round(ma20_val, 2) if ma20_val is not None else None,
         "ma50": round(ma50_val, 2) if ma50_val is not None else None,
         "ma200": round(ma200_val, 2) if ma200_val is not None else None,
+        "rsi14": rsi14,
+        "marketPhaseLabel": phase_label,
+        "streakBelowMa200": sb,
+        "streakAboveMa200": sa,
+        "volumeToday": vol_info["volume_today"],
+        "volumeAvg20": vol_info["volume_avg20"],
+        "volumeVsAvg20Pct": vol_info["volume_vs_avg20_pct"],
     }
+    out.update(breadth)
+    return out
 
 
 @app.get("/health")
@@ -720,8 +1015,8 @@ def health_check():
 @app.get("/vnindex-overview")
 def api_vnindex_overview():
     """
-    GET VN-Index overview: last, MA(20), MA(50), MA(200).
-    Dùng cho đánh giá xu hướng thị trường chung trong báo cáo phân tích.
+    GET VN-Index overview: last, MA(20/50/200), RSI14, pha thị trường (nhãn + streak MA200),
+    thanh khoản (20 phiên vs phiên hiện tại), % mẫu VN30 trên MA200.
     """
     result = _compute_vnindex_overview()
     if result is None:
@@ -790,6 +1085,301 @@ def api_moneyflow(req: MoneyflowRequest):
             }
 
     return JSONResponse(content={"data": data, "_debug": metadata})
+class MoneyFlowRequest(BaseModel):
+    tickers: List[str] = []
+    # Tổng hợp KN/TD theo số ngày lịch gần nhất.
+    # Front-end hiện tại đang gọi không truyền tham số này nên mặc định = 30.
+    totalDays: int = 30
+    # Chuỗi net theo phiên để vẽ trend (10-20 phiên gần nhất).
+    # Mặc định = 20.
+    trendSessions: int = 20
+
+
+def _ssi_env_consumer_credentials() -> tuple[Optional[str], Optional[str]]:
+    consumer_id = os.environ.get("SSI_FC_CONSUMER_ID") or os.environ.get("SSI_FC_CONSUMERID")
+    consumer_secret = (
+        os.environ.get("SSI_FC_CONSUMER_SECRET")
+        or os.environ.get("SSI_FC_CONSUMERSECRET")
+        or os.environ.get("SSI_FC_CONSUMERSECRECT")
+    )
+    return consumer_id, consumer_secret
+
+
+def _parse_sci_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+        return x if x == x and abs(x) < 1e30 else None
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        s = s.replace(",", "")
+        x = float(s)
+        return x if x == x and abs(x) < 1e30 else None
+    except Exception:
+        return None
+
+
+def _parse_fc_trading_date(date_str: str) -> Optional[datetime.date]:
+    import datetime
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.datetime.strptime(date_str, fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _format_iso_date(d: datetime.date) -> str:
+    return d.strftime("%Y-%m-%d")
+
+
+def _ssi_get_access_token(
+    base_url: str,
+    consumer_id: Optional[str],
+    consumer_secret: Optional[str],
+    timeout: int = 20,
+) -> Optional[str]:
+    if not consumer_id or not consumer_secret:
+        return None
+
+    import urllib.request
+
+    token_url = f"{base_url.rstrip('/')}/api/v2/Market/AccessToken"
+    payload = {"consumerID": consumer_id, "consumerSecret": consumer_secret}
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    req = urllib.request.Request(
+        token_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+
+    status = data.get("status", data.get("Status", None))
+    # Some responses may use string statuses; accept both.
+    if status not in (200, "SUCCESS", "Success", None):
+        # If status exists but isn't success, still fall through to try to extract token.
+        pass
+
+    token_data = data.get("data") or data.get("Data") or {}
+    token = token_data.get("accessToken") or token_data.get("access_token") or data.get("accessToken")
+    return str(token) if token else None
+
+
+def _ssi_get_daily_stock_price(
+    base_url: str,
+    token: str,
+    symbol: str,
+    from_date: datetime.date,
+    to_date: datetime.date,
+    page_index: int = 1,
+    page_size: int = 200,
+    market: str = "",
+    timeout: int = 25,
+) -> List[Dict[str, Any]]:
+    if not token:
+        return []
+
+    import urllib.parse
+    import urllib.request
+
+    endpoint = f"{base_url.rstrip('/')}/api/v2/Market/DailyStockPrice"
+    from_str = from_date.strftime("%d/%m/%Y")
+    to_str = to_date.strftime("%d/%m/%Y")
+
+    params = {
+        "symbol": symbol,
+        "fromDate": from_str,
+        "toDate": to_str,
+        "pageIndex": page_index,
+        "pageSize": page_size,
+        "market": market,
+    }
+    qs = urllib.parse.urlencode(params)
+    url = f"{endpoint}?{qs}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+
+    items = data.get("data") or data.get("Data") or []
+    if not isinstance(items, list):
+        return []
+    return items
+
+
+def _compute_money_flow_for_symbol(
+    symbol: str,
+    total_days: int,
+    trend_sessions: int,
+    ssi_base_url: str,
+    token: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    import datetime
+
+    if not token:
+        return None
+
+    today = datetime.date.today()
+    start_trend = today - datetime.timedelta(days=max(60, trend_sessions * 2))
+    start_total = today - datetime.timedelta(days=max(1, total_days))
+
+    items = _ssi_get_daily_stock_price(
+        base_url=ssi_base_url,
+        token=token,
+        symbol=symbol,
+        from_date=start_trend,
+        to_date=today,
+        page_index=1,
+        page_size=500,
+        market="",
+    )
+    if not items:
+        return None
+
+    parsed: List[Dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        trading_date_str = it.get("TradingDate") or it.get("tradingDate") or it.get("Trading_date")
+        if not trading_date_str:
+            continue
+        d = _parse_fc_trading_date(str(trading_date_str))
+        if not d:
+            continue
+
+        foreign_buy = _parse_sci_float(it.get("ForeignBuyValTotal"))
+        foreign_sell = _parse_sci_float(it.get("ForeignSellValTotal"))
+        total_buy = _parse_sci_float(it.get("TotalBuyTrade"))
+        total_sell = _parse_sci_float(it.get("TotalSellTrade"))
+        if foreign_buy is None or foreign_sell is None:
+            continue
+
+        # Tự doanh (proprietary) = tổng giao dịch (total) - phần của khối ngoại.
+        if total_buy is None:
+            total_buy = foreign_buy
+        if total_sell is None:
+            total_sell = foreign_sell
+
+        proprietary_buy = max(0.0, total_buy - foreign_buy)
+        proprietary_sell = max(0.0, total_sell - foreign_sell)
+
+        parsed.append(
+            {
+                "date": _format_iso_date(d),
+                "foreignBuy": foreign_buy,
+                "foreignSell": foreign_sell,
+                "proprietaryBuy": proprietary_buy,
+                "proprietarySell": proprietary_sell,
+                "foreignNet": foreign_buy - foreign_sell,
+                "proprietaryNet": proprietary_buy - proprietary_sell,
+                "d": d,
+            }
+        )
+
+    if not parsed:
+        return None
+
+    parsed.sort(key=lambda x: x["d"])
+    trend_tail = parsed[-max(1, trend_sessions) :]
+    if not trend_tail:
+        return None
+
+    trend_foreign = [
+        {
+            "date": p["date"],
+            "buy": round(p["foreignBuy"]),
+            "sell": round(p["foreignSell"]),
+            "net": round(p["foreignNet"]),
+        }
+        for p in trend_tail
+    ]
+    trend_prop = [
+        {
+            "date": p["date"],
+            "buy": round(p["proprietaryBuy"]),
+            "sell": round(p["proprietarySell"]),
+            "net": round(p["proprietaryNet"]),
+        }
+        for p in trend_tail
+    ]
+
+    # Totals: sum foreign/proprietary in last `total_days` calendar window.
+    totals = [p for p in parsed if p["d"] >= start_total]
+    foreignBuy = round(sum(p["foreignBuy"] for p in totals))
+    foreignSell = round(sum(p["foreignSell"] for p in totals))
+    proprietaryBuy = round(sum(p["proprietaryBuy"] for p in totals))
+    proprietarySell = round(sum(p["proprietarySell"] for p in totals))
+
+    return {
+        "foreignBuy": foreignBuy,
+        "foreignSell": foreignSell,
+        "proprietaryBuy": proprietaryBuy,
+        "proprietarySell": proprietarySell,
+        "foreignNetSeries": trend_foreign,
+        "proprietaryNetSeries": trend_prop,
+    }
+
+
+@app.post("/api/moneyflow")
+def api_moneyflow(req: MoneyFlowRequest):
+    """
+    POST /api/moneyflow
+    Trả về:
+      - Tổng foreign/proprietary trong cửa sổ `totalDays` (mặc định 30 ngày lịch)
+      - Chuỗi net theo từng phiên `trendSessions` (mặc định 20 phiên gần nhất)
+    """
+    consumer_id, consumer_secret = _ssi_env_consumer_credentials()
+    ssi_base_url = os.environ.get("SSI_FC_BASE_URL", "https://fc-data.ssi.com.vn")
+
+    token = _ssi_get_access_token(
+        base_url=ssi_base_url,
+        consumer_id=consumer_id,
+        consumer_secret=consumer_secret,
+    )
+    if not token:
+        return JSONResponse(content={"data": {}}, status_code=200)
+
+    tickers = req.tickers or []
+    total_days = int(req.totalDays or 30)
+    trend_sessions = int(req.trendSessions or 20)
+    unique = list({str(t).strip().upper() for t in tickers if t})
+
+    # Bật song song để giảm tổng thời gian khi có nhiều mã.
+    workers = min(8, max(1, len(unique)))
+    out: Dict[str, Any] = {}
+    if unique:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _compute_money_flow_for_symbol,
+                    symbol,
+                    total_days,
+                    trend_sessions,
+                    ssi_base_url,
+                    token,
+                ): symbol
+                for symbol in unique
+            }
+            for fut, symbol in futures.items():
+                try:
+                    res = fut.result(timeout=90)
+                    if res:
+                        out[symbol] = res
+                except Exception:
+                    continue
+
+    return JSONResponse(content={"data": out})
 
 
 @app.post("/api/fundamentals")
@@ -883,6 +1473,72 @@ class handler(BaseHTTPRequestHandler):
                     continue
 
             out = json.dumps({"data": data}, ensure_ascii=False)
+
+        # Vercel handler: phân nhánh theo path để hỗ trợ nhiều API.
+        if "moneyflow" in str(getattr(self, "path", "")).lower():
+            try:
+                total_days = int(payload.get("totalDays") or 30)
+                trend_sessions = int(payload.get("trendSessions") or 20)
+            except Exception:
+                total_days = 30
+                trend_sessions = 20
+
+            consumer_id, consumer_secret = _ssi_env_consumer_credentials()
+            ssi_base_url = os.environ.get("SSI_FC_BASE_URL", "https://fc-data.ssi.com.vn")
+            token = _ssi_get_access_token(
+                base_url=ssi_base_url,
+                consumer_id=consumer_id,
+                consumer_secret=consumer_secret,
+            )
+            if not token:
+                out = {"data": {}}
+                out_json = json.dumps(out, ensure_ascii=False)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(out_json.encode("utf-8"))
+                return
+
+            out: Dict[str, Any] = {}
+            if unique:
+                workers = min(8, max(1, len(unique)))
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(
+                            _compute_money_flow_for_symbol,
+                            symbol,
+                            total_days,
+                            trend_sessions,
+                            ssi_base_url,
+                            token,
+                        ): symbol
+                        for symbol in unique
+                    }
+                    for fut, symbol in futures.items():
+                        try:
+                            res = fut.result(timeout=90)
+                            if res:
+                                out[symbol] = res
+                        except Exception:
+                            continue
+
+            out_json = json.dumps({"data": out}, ensure_ascii=False)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(out_json.encode("utf-8"))
+            return
+
+        data: Dict[str, Dict[str, Optional[float]]] = {}
+        for symbol in unique:
+            try:
+                item = _extract_for_sources(symbol, SOURCES)
+                if any(x is not None for x in item.values()):
+                    data[symbol] = item
+            except Exception:
+                continue
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
