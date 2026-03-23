@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
@@ -112,6 +114,43 @@ class MoneyflowRequest(BaseModel):
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
 _RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
 SOURCES = [s.strip() for s in _RAW_SOURCES.split(",") if s.strip()]
+
+# Mặc định tắt field "nặng" để giảm số request/ticker khi dùng Guest plan.
+# Có thể bật lại bằng FUNDAMENTALS_ENABLE_HEAVY_FIELDS=1.
+_ENABLE_HEAVY_FIELDS = (
+    str(os.environ.get("FUNDAMENTALS_ENABLE_HEAVY_FIELDS", "0")).strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+_FUNDAMENTALS_CACHE_TTL_SECONDS = max(
+    10, int(os.environ.get("FUNDAMENTALS_CACHE_TTL_SECONDS", "300"))
+)
+_MONEYFLOW_CACHE_TTL_SECONDS = max(
+    10, int(os.environ.get("MONEYFLOW_CACHE_TTL_SECONDS", "120"))
+)
+_cache_lock = Lock()
+_fundamentals_cache: Dict[str, Dict[str, Any]] = {}
+_moneyflow_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _cache_get(cache: Dict[str, Dict[str, Any]], key: str) -> Optional[Any]:
+    now = time.time()
+    with _cache_lock:
+        entry = cache.get(key)
+        if not entry:
+            return None
+        if entry.get("expires_at", 0) <= now:
+            try:
+                del cache[key]
+            except KeyError:
+                pass
+            return None
+        return entry.get("value")
+
+
+def _cache_set(cache: Dict[str, Dict[str, Any]], key: str, value: Any, ttl_seconds: int) -> None:
+    with _cache_lock:
+        cache[key] = {"value": value, "expires_at": time.time() + max(1, ttl_seconds)}
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -457,15 +496,16 @@ def _extract(symbol: str, source: str) -> Dict[str, Any]:
     if cash_flow_operating is not None or cash_flow_net is not None:
         result["cash_flow_operating"] = cash_flow_operating
         result["cash_flow_net"] = cash_flow_net
-    # Khối ngoại & tự doanh (optional, cần vnstock_data)
-    flow = _get_trading_flow(symbol)
-    if flow:
-        result["trading_flow"] = {k: v for k, v in flow.items() if v is not None}
-    # Volume MA20/MA50 từ lịch sử khối lượng giao dịch
-    volume_ma = _get_symbol_volume_ma(symbol, preferred_source=source)
-    if volume_ma:
-        volume_ma20 = volume_ma.get("volume_ma20")
-        volume_ma50 = volume_ma.get("volume_ma50")
+    if _ENABLE_HEAVY_FIELDS:
+        # Khối ngoại & tự doanh (optional, cần vnstock_data)
+        flow = _get_trading_flow(symbol)
+        if flow:
+            result["trading_flow"] = {k: v for k, v in flow.items() if v is not None}
+        # Volume MA20/MA50 từ lịch sử khối lượng giao dịch
+        volume_ma = _get_symbol_volume_ma(symbol, preferred_source=source)
+        if volume_ma:
+            volume_ma20 = volume_ma.get("volume_ma20")
+            volume_ma50 = volume_ma.get("volume_ma50")
     if volume_ma20 is not None:
         result["volume_ma20"] = volume_ma20
     if volume_ma50 is not None:
@@ -1360,22 +1400,34 @@ def api_moneyflow(req: MoneyFlowRequest):
     out: Dict[str, Any] = {}
     if unique:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _compute_money_flow_for_symbol,
-                    symbol,
-                    total_days,
-                    trend_sessions,
-                    ssi_base_url,
-                    token,
-                ): symbol
-                for symbol in unique
-            }
+            futures = {}
+            for symbol in unique:
+                cache_key = f"{symbol}|{total_days}|{trend_sessions}"
+                cached = _cache_get(_moneyflow_cache, cache_key)
+                if cached is not None:
+                    out[symbol] = cached
+                    continue
+                futures[
+                    pool.submit(
+                        _compute_money_flow_for_symbol,
+                        symbol,
+                        total_days,
+                        trend_sessions,
+                        ssi_base_url,
+                        token,
+                    )
+                ] = (symbol, cache_key)
             for fut, symbol in futures.items():
                 try:
                     res = fut.result(timeout=90)
                     if res:
-                        out[symbol] = res
+                        out[symbol[0]] = res
+                        _cache_set(
+                            _moneyflow_cache,
+                            symbol[1],
+                            res,
+                            _MONEYFLOW_CACHE_TTL_SECONDS,
+                        )
                 except Exception:
                     continue
 
@@ -1399,11 +1451,23 @@ def api_fundamentals(req: FundamentalsRequest):
     unique = list({str(t).strip().upper() for t in tickers if t})
     data: Dict[str, Dict[str, float]] = {}
     for symbol in unique:
+        cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
+        cached = _cache_get(_fundamentals_cache, cache_key)
+        if cached is not None:
+            data[symbol] = cached
+            continue
         try:
             item = _extract_for_sources(symbol, SOURCES)
             if any(x is not None for x in item.values()):
                 # Loại bỏ None để tránh ResponseValidationError
-                data[symbol] = {k: v for k, v in item.items() if v is not None}
+                cleaned = {k: v for k, v in item.items() if v is not None}
+                data[symbol] = cleaned
+                _cache_set(
+                    _fundamentals_cache,
+                    cache_key,
+                    cleaned,
+                    _FUNDAMENTALS_CACHE_TTL_SECONDS,
+                )
         except Exception:
             continue
     return JSONResponse(content={"data": data})
