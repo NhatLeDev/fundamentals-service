@@ -1473,6 +1473,109 @@ def api_fundamentals(req: FundamentalsRequest):
     return JSONResponse(content={"data": data})
 
 
+class MarketBatchRequest(BaseModel):
+    tickers: List[str] = []
+    includeFundamentals: bool = True
+    includeMoneyFlow: bool = True
+    totalDays: int = 30
+    trendSessions: int = 20
+
+
+@app.post("/api/market-batch")
+def api_market_batch(req: MarketBatchRequest):
+    """
+    Gom dữ liệu fundamentals + moneyflow trong 1 request để giảm số lần gọi API.
+    Response:
+      {
+        "data": {
+          "MBB": {
+            "fundamentals": {...} | null,
+            "moneyFlow": {...} | null
+          }
+        }
+      }
+    """
+    tickers = req.tickers or []
+    unique = list({str(t).strip().upper() for t in tickers if t})
+
+    include_f = bool(req.includeFundamentals)
+    include_m = bool(req.includeMoneyFlow)
+    total_days = int(req.totalDays or 30)
+    trend_sessions = int(req.trendSessions or 20)
+
+    out: Dict[str, Dict[str, Any]] = {
+        t: {"fundamentals": None, "moneyFlow": None} for t in unique
+    }
+
+    # 1) fundamentals
+    if include_f:
+        for symbol in unique:
+            cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
+            cached = _cache_get(_fundamentals_cache, cache_key)
+            if cached is not None:
+                out[symbol]["fundamentals"] = cached
+                continue
+            try:
+                item = _extract_for_sources(symbol, SOURCES)
+                if any(x is not None for x in item.values()):
+                    cleaned = {k: v for k, v in item.items() if v is not None}
+                    out[symbol]["fundamentals"] = cleaned
+                    _cache_set(
+                        _fundamentals_cache,
+                        cache_key,
+                        cleaned,
+                        _FUNDAMENTALS_CACHE_TTL_SECONDS,
+                    )
+            except Exception:
+                continue
+
+    # 2) moneyflow (1 token cho cả lô ticker để giảm overhead)
+    if include_m and unique:
+        consumer_id, consumer_secret = _ssi_env_consumer_credentials()
+        ssi_base_url = os.environ.get("SSI_FC_BASE_URL", "https://fc-data.ssi.com.vn")
+        token = _ssi_get_access_token(
+            base_url=ssi_base_url,
+            consumer_id=consumer_id,
+            consumer_secret=consumer_secret,
+        )
+        if token:
+            workers = min(8, max(1, len(unique)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {}
+                for symbol in unique:
+                    cache_key = f"{symbol}|{total_days}|{trend_sessions}"
+                    cached = _cache_get(_moneyflow_cache, cache_key)
+                    if cached is not None:
+                        out[symbol]["moneyFlow"] = cached
+                        continue
+                    futures[
+                        pool.submit(
+                            _compute_money_flow_for_symbol,
+                            symbol,
+                            total_days,
+                            trend_sessions,
+                            ssi_base_url,
+                            token,
+                        )
+                    ] = (symbol, cache_key)
+
+                for fut, (symbol, cache_key) in futures.items():
+                    try:
+                        res = fut.result(timeout=90)
+                        if res:
+                            out[symbol]["moneyFlow"] = res
+                            _cache_set(
+                                _moneyflow_cache,
+                                cache_key,
+                                res,
+                                _MONEYFLOW_CACHE_TTL_SECONDS,
+                            )
+                    except Exception:
+                        continue
+
+    return JSONResponse(content={"data": out})
+
+
 def handler(req: BaseHTTPRequestHandler):
     """Vercel gọi do_POST; req là self (BaseHTTPRequestHandler)."""
     pass
