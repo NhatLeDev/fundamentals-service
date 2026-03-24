@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from threading import Lock
@@ -128,18 +129,90 @@ _FUNDAMENTALS_CACHE_TTL_SECONDS = max(
 _MONEYFLOW_CACHE_TTL_SECONDS = max(
     10, int(os.environ.get("MONEYFLOW_CACHE_TTL_SECONDS", "120"))
 )
+_VNINDEX_CACHE_TTL_SECONDS = max(
+    10, int(os.environ.get("VNINDEX_CACHE_TTL_SECONDS", "300"))
+)
+_VN30_BREADTH_CACHE_TTL_SECONDS = max(
+    10, int(os.environ.get("VN30_BREADTH_CACHE_TTL_SECONDS", "600"))
+)
 _cache_lock = Lock()
 _fundamentals_cache: Dict[str, Dict[str, Any]] = {}
 _moneyflow_cache: Dict[str, Dict[str, Any]] = {}
+_vnindex_cache: Dict[str, Dict[str, Any]] = {}
+_vn30_breadth_cache: Dict[str, Dict[str, Any]] = {}
+
+# Rate limiter for vnstock API calls
+class VnstockRateLimiter:
+    """Simple rate limiter to prevent exceeding vnstock API limits."""
+    
+    def __init__(self, max_calls: int = 10, time_window: int = 60):
+        self.max_calls = max_calls
+        self.time_window = time_window
+        self.calls: deque = deque()
+        self.lock = Lock()
+        self._rate_limited_until = 0.0
+    
+    def set_rate_limited(self, seconds: int = 60):
+        """Mark as rate limited for a duration."""
+        with self.lock:
+            self._rate_limited_until = time.time() + seconds
+    
+    def is_rate_limited(self) -> bool:
+        """Check if currently in rate-limited cooldown."""
+        with self.lock:
+            return time.time() < self._rate_limited_until
+    
+    def can_proceed(self) -> tuple:
+        """Check if a call can proceed. Returns (can_proceed, wait_time)."""
+        if self.is_rate_limited():
+            wait_time = self._rate_limited_until - time.time()
+            return False, max(0, wait_time)
+        
+        with self.lock:
+            now = time.time()
+            # Remove calls outside the time window
+            while self.calls and self.calls[0] < now - self.time_window:
+                self.calls.popleft()
+            
+            if len(self.calls) < self.max_calls:
+                return True, 0.0
+            
+            # Calculate wait time
+            wait_time = self.calls[0] + self.time_window - now
+            return False, max(0, wait_time)
+    
+    def record_call(self):
+        """Record a successful API call."""
+        with self.lock:
+            self.calls.append(time.time())
+    
+    def wait_if_needed(self, max_wait: float = 5.0) -> bool:
+        """Wait if needed. Returns False if wait > max_wait."""
+        can_proceed, wait_time = self.can_proceed()
+        if can_proceed:
+            return True
+        if wait_time > max_wait:
+            return False
+        time.sleep(wait_time + 0.1)
+        return True
+
+# Initialize rate limiter with conservative limit (50% of Guest tier for safety)
+_vnstock_limiter = VnstockRateLimiter(
+    max_calls=int(os.environ.get("VNSTOCK_MAX_CALLS_PER_MINUTE", "10")),
+    time_window=60
+)
 
 
-def _cache_get(cache: Dict[str, Dict[str, Any]], key: str) -> Optional[Any]:
+def _cache_get(cache: Dict[str, Dict[str, Any]], key: str, include_expired: bool = False) -> Optional[Any]:
+    """Get cached value. If include_expired=True, return even expired values (for fallback)."""
     now = time.time()
     with _cache_lock:
         entry = cache.get(key)
         if not entry:
             return None
         if entry.get("expires_at", 0) <= now:
+            if include_expired:
+                return entry.get("value")
             try:
                 del cache[key]
             except KeyError:
@@ -586,6 +659,17 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
     """Chuỗi nến daily VN-Index (cũ → mới): close, volume (0 nếu nguồn không có)."""
     if days <= 0:
         days = 260
+    
+    # Try cache first
+    cache_key = f"vnindex_bars_{days}"
+    cached = _cache_get(_vnindex_cache, cache_key)
+    if cached is not None:
+        return cached
+    
+    # Check if rate limited - return stale cache if available
+    if _vnstock_limiter.is_rate_limited():
+        stale = _cache_get(_vnindex_cache, cache_key, include_expired=True)
+        return stale
 
     def _bars_from_df(df) -> Optional[List[Dict[str, float]]]:
         if df is None or (hasattr(df, "empty") and df.empty) or len(df) == 0:
@@ -616,38 +700,69 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
 
     # 1) Quote.history - KBS/TCBS/DNSE (cloud), VCI (có thể bị chặn)
     if Quote is not None:
-        for source in ("KBS", "TCBS", "DNSE", "VCI"):
+        for source in ("KBS", "TCBS", "DNSE"):  # Skip VCI to save API calls
+            # Check rate limiter before each call
+            if not _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                break  # Wait too long, skip to fallback
+            
             try:
                 quote = Quote(symbol="VNINDEX", source=source)
+                _vnstock_limiter.record_call()
+                
+                if not _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                    break
+                
                 df = quote.history(length="1Y", interval="1D")
+                _vnstock_limiter.record_call()
+                
                 bars = _bars_from_df(df)
                 if bars:
+                    # Cache for 5 minutes
+                    _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
                     return bars
-            except Exception:
+            except Exception as e:
+                # Check if rate limited
+                error_msg = str(e).lower()
+                if "rate limit" in error_msg or "too many" in error_msg:
+                    _vnstock_limiter.set_rate_limited(60)
+                    # Try to return stale cache
+                    stale = _cache_get(_vnindex_cache, cache_key, include_expired=True)
+                    if stale:
+                        return stale
+                    break
                 continue
         try:
             from datetime import date, timedelta
 
             end_d = date.today()
             start_d = end_d - timedelta(days=days * 2)
-            quote = Quote(symbol="VNINDEX", source="KBS")
-            df = quote.history(
-                start=start_d.strftime("%Y-%m-%d"),
-                end=end_d.strftime("%Y-%m-%d"),
-                interval="1D",
-            )
-            bars = _bars_from_df(df)
-            if bars:
-                return bars
+            
+            if _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                quote = Quote(symbol="VNINDEX", source="KBS")
+                _vnstock_limiter.record_call()
+                
+                if _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                    df = quote.history(
+                        start=start_d.strftime("%Y-%m-%d"),
+                        end=end_d.strftime("%Y-%m-%d"),
+                        interval="1D",
+                    )
+                    _vnstock_limiter.record_call()
+                    bars = _bars_from_df(df)
+                    if bars:
+                        _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
+                        return bars
         except Exception:
             pass
 
     # 2) get_index_series
-    if get_index_series is not None:
+    if get_index_series is not None and _vnstock_limiter.wait_if_needed(max_wait=3.0):
         try:
             df = get_index_series(index_code="VNINDEX", time_range="OneYear")
+            _vnstock_limiter.record_call()
             bars = _bars_from_df(df)
             if bars:
+                _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
                 return bars
         except Exception:
             pass
@@ -661,23 +776,29 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
             start_d = end_d - timedelta(days=days * 2)
             start_str = start_d.strftime("%Y-%m-%d")
             end_str = end_d.strftime("%Y-%m-%d")
-            for kwargs in [
-                {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str, "type": "index"},
-                {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str},
-            ]:
-                try:
-                    df = stock_historical_data(**kwargs)
-                    bars = _bars_from_df(df)
-                    if bars:
-                        return bars
-                except TypeError:
+            
+            if _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                for kwargs in [
+                    {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str, "type": "index"},
+                    {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str},
+                ]:
                     try:
-                        df = stock_historical_data("VNINDEX", start_str, end_str)
+                        df = stock_historical_data(**kwargs)
+                        _vnstock_limiter.record_call()
                         bars = _bars_from_df(df)
                         if bars:
+                            _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
                             return bars
-                    except Exception:
-                        pass
+                    except TypeError:
+                        try:
+                            df = stock_historical_data("VNINDEX", start_str, end_str)
+                            _vnstock_limiter.record_call()
+                            bars = _bars_from_df(df)
+                            if bars:
+                                _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
+                                return bars
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -922,22 +1043,68 @@ def _get_equity_close_prices(symbol: str, days: int = 220) -> Optional[List[floa
 
 
 def _vn30_one_above_ma200(sym: str) -> Optional[bool]:
+    """Check if a VN30 stock is above MA200 with caching."""
+    # Check cache first (cache each symbol for 30 minutes since MA200 changes slowly)
+    cache_key = f"vn30_ma200_{sym}"
+    cached = _cache_get(_vn30_breadth_cache, cache_key)
+    if cached is not None:
+        return cached
+    
+    # Check rate limiter
+    if not _vnstock_limiter.wait_if_needed(max_wait=2.0):
+        return None  # Skip if rate limited
+    
     closes = _get_equity_close_prices(sym, 220)
+    _vnstock_limiter.record_call()
+    
     if not closes or len(closes) < 200:
         return None
     last_c = closes[-1]
     ma200 = sum(closes[-200:]) / 200.0
-    return last_c > ma200
+    result = last_c > ma200
+    
+    # Cache for 30 minutes (MA200 data changes slowly)
+    _cache_set(_vn30_breadth_cache, cache_key, result, 1800)
+    
+    return result
 
 
 def _compute_vn30_above_ma200_breadth() -> Dict[str, Any]:
+    """
+    Compute VN30 breadth with aggressive caching.
+    This is cached for 10 minutes to avoid 30+ API calls per request.
+    """
+    cache_key = "vn30_breadth_full"
+    
+    # Try cache first
+    cached = _cache_get(_vn30_breadth_cache, cache_key)
+    if cached is not None:
+        return cached
+    
+    # Check if rate limited - return stale data if available
+    if _vnstock_limiter.is_rate_limited():
+        stale = _cache_get(_vn30_breadth_cache, cache_key, include_expired=True)
+        if stale:
+            return stale
+        # Return empty result if no stale data
+        return {
+            "vn30AboveMa200Pct": None,
+            "vn30AboveMa200Count": None,
+            "vn30BreadthSampleSize": None,
+            "vn30BreadthFailedFetch": None,
+        }
+    
     symbols = _vn30_symbol_list()
     above = 0
     total = 0
     failed = 0
-    workers = min(10, max(1, len(symbols)))
+    
+    # Reduce workers to avoid burst requests (was 10, now 2-3)
+    workers = min(2, max(1, len(symbols) // 15))
+    
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(_vn30_one_above_ma200, symbols))
+    
     for ok in results:
         if ok is None:
             failed += 1
@@ -945,15 +1112,22 @@ def _compute_vn30_above_ma200_breadth() -> Dict[str, Any]:
             total += 1
             if ok:
                 above += 1
+    
     pct: Optional[float] = None
     if total > 0:
         pct = round(100.0 * above / total, 2)
-    return {
+    
+    result = {
         "vn30AboveMa200Pct": pct,
         "vn30AboveMa200Count": above,
         "vn30BreadthSampleSize": total,
         "vn30BreadthFailedFetch": failed,
     }
+    
+    # Cache for 10 minutes (breadth doesn't change frequently)
+    _cache_set(_vn30_breadth_cache, cache_key, result, _VN30_BREADTH_CACHE_TTL_SECONDS)
+    
+    return result
 
 
 def _volume_today_vs_avg20(bars: List[Dict[str, float]]) -> Dict[str, Any]:
@@ -981,9 +1155,17 @@ def _volume_today_vs_avg20(bars: List[Dict[str, float]]) -> Dict[str, Any]:
 
 def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
     """Tính last, MA, RSI, thanh khoản, pha thị trường, breadth VN30/MA200."""
+    # Try cache first (5 minutes)
+    cache_key = "vnindex_overview_full"
+    cached = _cache_get(_vnindex_cache, cache_key)
+    if cached is not None:
+        return cached
+    
     bars = _get_vnindex_bars(260)
     if not bars or len(bars) < 20:
-        return None
+        # Try to return stale cache if rate limited
+        stale = _cache_get(_vnindex_cache, cache_key, include_expired=True)
+        return stale
 
     bars = _normalize_vnindex_bars(bars)
     prices = [b["close"] for b in bars]
@@ -1033,6 +1215,10 @@ def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
         "volumeVsAvg20Pct": vol_info["volume_vs_avg20_pct"],
     }
     out.update(breadth)
+    
+    # Cache the complete overview for 5 minutes
+    _cache_set(_vnindex_cache, cache_key, out, _VNINDEX_CACHE_TTL_SECONDS)
+    
     return out
 
 
@@ -1048,6 +1234,17 @@ def health_check():
         "version": "1.0.0",
         "vnstock_available": True,
         "trading_available": _Trading is not None,
+        "rate_limiter": {
+            "calls_in_last_minute": len(_vnstock_limiter.calls),
+            "is_rate_limited": _vnstock_limiter.is_rate_limited(),
+            "max_calls_per_minute": _vnstock_limiter.max_calls,
+        },
+        "cache_stats": {
+            "vnindex_entries": len(_vnindex_cache),
+            "vn30_breadth_entries": len(_vn30_breadth_cache),
+            "fundamentals_entries": len(_fundamentals_cache),
+            "moneyflow_entries": len(_moneyflow_cache),
+        }
     })
 
 
@@ -1057,11 +1254,44 @@ def api_vnindex_overview():
     """
     GET VN-Index overview: last, MA(20/50/200), RSI14, pha thị trường (nhãn + streak MA200),
     thanh khoản (20 phiên vs phiên hiện tại), % mẫu VN30 trên MA200.
+    With circuit breaker for rate limits.
     """
-    result = _compute_vnindex_overview()
-    if result is None:
-        return JSONResponse(content={"error": "Không lấy được dữ liệu VN-Index"}, status_code=503)
-    return JSONResponse(content=result)
+    try:
+        result = _compute_vnindex_overview()
+        if result is None:
+            # Check if we have stale cache
+            cache_key = "vnindex_overview_full"
+            stale = _cache_get(_vnindex_cache, cache_key, include_expired=True)
+            if stale:
+                return JSONResponse(content={
+                    **stale,
+                    "_cached": True,
+                    "_warning": "Using cached data due to rate limits or service issues"
+                })
+            
+            return JSONResponse(
+                content={"error": "Không lấy được dữ liệu VN-Index. Vui lòng thử lại sau."},
+                status_code=503
+            )
+        return JSONResponse(content=result)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "rate limit" in error_msg or "too many" in error_msg:
+            _vnstock_limiter.set_rate_limited(60)
+            # Try to return stale cache
+            cache_key = "vnindex_overview_full"
+            stale = _cache_get(_vnindex_cache, cache_key, include_expired=True)
+            if stale:
+                return JSONResponse(content={
+                    **stale,
+                    "_cached": True,
+                    "_warning": "Rate limited, using cached data"
+                })
+        
+        return JSONResponse(
+            content={"error": "Không lấy được dữ liệu VN-Index"},
+            status_code=503
+        )
 
 
 @app.post("/api/moneyflow")
