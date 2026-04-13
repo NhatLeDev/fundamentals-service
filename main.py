@@ -1393,77 +1393,6 @@ def api_vnindex_overview():
         )
 
 
-@app.post("/api/moneyflow")
-@app.post("/moneyflow")
-def api_moneyflow(req: MoneyflowRequest):
-    """
-    POST /api/moneyflow
-
-    Request body:
-      { "tickers": ["SSI", "MBB"], "days": 30 }
-
-    Response:
-      { "data": { "SSI": {
-          "foreignBuy": number,
-          "foreignSell": number,
-          "proprietaryBuy": number,
-          "proprietarySell": number
-      }, ... } }
-    """
-    tickers = req.tickers or []
-    days = req.days if req.days is not None else 30
-    try:
-        days_int = int(days)
-    except Exception:
-        days_int = 30
-    days_int = days_int if days_int > 0 else 30
-
-    unique = list({str(t).strip().upper() for t in tickers if t})
-    data: Dict[str, Dict[str, Optional[float]]] = {}
-    
-    # Add metadata for debugging
-    metadata = {
-        "requested_tickers": unique,
-        "days": days_int,
-        "trading_available": _Trading is not None,
-    }
-
-    for symbol in unique:
-        try:
-            mf = _get_moneyflow(symbol, days=days_int)
-            data[symbol] = mf or {
-                "foreignBuy": None,
-                "foreignSell": None,
-                "proprietaryBuy": None,
-                "proprietarySell": None,
-                "foreignRoomCurrent": None,
-                "foreignRoomTotal": None,
-                "foreignOwnership": None,
-            }
-        except Exception as e:
-            # Log error but continue with other symbols
-            print(f"Error fetching moneyflow for {symbol}: {str(e)}")
-            data[symbol] = {
-                "foreignBuy": None,
-                "foreignSell": None,
-                "proprietaryBuy": None,
-                "proprietarySell": None,
-                "foreignRoomCurrent": None,
-                "foreignRoomTotal": None,
-                "foreignOwnership": None,
-            }
-
-    return JSONResponse(content={"data": data, "_debug": metadata})
-class MoneyFlowRequest(BaseModel):
-    tickers: List[str] = []
-    # Tổng hợp KN/TD theo số ngày lịch gần nhất.
-    # Front-end hiện tại đang gọi không truyền tham số này nên mặc định = 30.
-    totalDays: int = 30
-    # Chuỗi net theo phiên để vẽ trend (10-20 phiên gần nhất).
-    # Mặc định = 20.
-    trendSessions: int = 20
-
-
 def _ssi_env_consumer_credentials() -> tuple[Optional[str], Optional[str]]:
     consumer_id = os.environ.get("SSI_FC_CONSUMER_ID") or os.environ.get("SSI_FC_CONSUMERID")
     consumer_secret = (
@@ -1700,67 +1629,102 @@ def _compute_money_flow_for_symbol(
     }
 
 
-@app.post("/api/moneyflow")
-def api_moneyflow(req: MoneyFlowRequest):
+def _build_moneyflow_response(
+    unique: List[str], total_days: int, trend_sessions: int
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    POST /api/moneyflow
-    Trả về:
-      - Tổng foreign/proprietary trong cửa sổ `totalDays` (mặc định 30 ngày lịch)
-      - Chuỗi net theo từng phiên `trendSessions` (mặc định 20 phiên gần nhất)
+    SSI FastConnect + fallback vnstock_data. Dùng chung cho FastAPI và Vercel handler.
     """
     consumer_id, consumer_secret = _ssi_env_consumer_credentials()
     ssi_base_url = os.environ.get("SSI_FC_BASE_URL", "https://fc-data.ssi.com.vn")
-
     token = _ssi_get_access_token(
         base_url=ssi_base_url,
         consumer_id=consumer_id,
         consumer_secret=consumer_secret,
     )
-    if not token:
-        return JSONResponse(content={"data": {}}, status_code=200)
 
-    tickers = req.tickers or []
-    total_days = int(req.totalDays or 30)
-    trend_sessions = int(req.trendSessions or 20)
-    unique = list({str(t).strip().upper() for t in tickers if t})
-
-    # Bật song song để giảm tổng thời gian khi có nhiều mã.
-    workers = min(8, max(1, len(unique)))
-    out: Dict[str, Any] = {}
-    if unique:
+    ssi_by_symbol: Dict[str, Dict[str, Any]] = {}
+    if token and unique:
+        workers = min(8, max(1, len(unique)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {}
             for symbol in unique:
                 cache_key = f"{symbol}|{total_days}|{trend_sessions}"
                 cached = _cache_get(_moneyflow_cache, cache_key)
                 if cached is not None:
-                    out[symbol] = cached
+                    ssi_by_symbol[symbol] = cached
                     continue
-                futures[
-                    pool.submit(
-                        _compute_money_flow_for_symbol,
-                        symbol,
-                        total_days,
-                        trend_sessions,
-                        ssi_base_url,
-                        token,
-                    )
-                ] = (symbol, cache_key)
-            for fut, symbol in futures.items():
+                fut = pool.submit(
+                    _compute_money_flow_for_symbol,
+                    symbol,
+                    total_days,
+                    trend_sessions,
+                    ssi_base_url,
+                    token,
+                )
+                futures[fut] = (symbol, cache_key)
+            for fut, (sym, cache_key) in futures.items():
                 try:
                     res = fut.result(timeout=90)
                     if res:
-                        out[symbol[0]] = res
+                        ssi_by_symbol[sym] = res
                         _cache_set(
                             _moneyflow_cache,
-                            symbol[1],
+                            cache_key,
                             res,
                             _MONEYFLOW_CACHE_TTL_SECONDS,
                         )
                 except Exception:
                     continue
 
-    return JSONResponse(content={"data": out})
+    out: Dict[str, Any] = {}
+    for sym in unique:
+        ssi_res = ssi_by_symbol.get(sym)
+        if _moneyflow_api_totals_nonzero(ssi_res):
+            out[sym] = ssi_res
+            continue
+        vn_flat = _get_moneyflow(sym, days=total_days)
+        vn_payload = _vnstock_moneyflow_to_api_shape(vn_flat or {}, total_days)
+        if vn_payload:
+            out[sym] = vn_payload
+        elif ssi_res:
+            out[sym] = ssi_res
+
+    debug = {
+        "requested_tickers": unique,
+        "totalDays": total_days,
+        "trendSessions": trend_sessions,
+        "trading_available": _Trading is not None,
+        "ssi_token_available": bool(token),
+    }
+    return out, debug
+
+
+@app.post("/api/moneyflow")
+@app.post("/moneyflow")
+def api_moneyflow(req: MoneyFlowRequest):
+    """
+    POST /api/moneyflow
+
+    Ưu tiên SSI FastConnect (chuỗi theo phiên + tổng cửa sổ). Nếu không có token SSI,
+    hoặc từng mã không có số liệu khả dụng từ SSI, fallback qua vnstock_data (VCI → TCBS → SSI).
+    """
+    tickers = req.tickers or []
+    raw_td = req.days if req.days is not None else req.totalDays
+    try:
+        total_days = int(raw_td or 30)
+    except Exception:
+        total_days = 30
+    total_days = max(1, total_days)
+    try:
+        trend_sessions = int(req.trendSessions or 20)
+    except Exception:
+        trend_sessions = 20
+    trend_sessions = max(1, trend_sessions)
+
+    unique = list({str(t).strip().upper() for t in tickers if t})
+    out, debug = _build_moneyflow_response(unique, total_days, trend_sessions)
+    return JSONResponse(content={"data": out, "_debug": debug})
 
 
 @app.post("/api/fundamentals")
@@ -1858,7 +1822,7 @@ def api_market_batch(req: MarketBatchRequest):
             except Exception:
                 continue
 
-    # 2) moneyflow (1 token cho cả lô ticker để giảm overhead)
+    # 2) moneyflow: SSI FastConnect (nếu có token) + fallback vnstock_data cho từng mã thiếu số liệu
     if include_m and unique:
         consumer_id, consumer_secret = _ssi_env_consumer_credentials()
         ssi_base_url = os.environ.get("SSI_FC_BASE_URL", "https://fc-data.ssi.com.vn")
@@ -1902,6 +1866,15 @@ def api_market_batch(req: MarketBatchRequest):
                     except Exception:
                         continue
 
+        for symbol in unique:
+            mf_cur = out[symbol].get("moneyFlow")
+            if _moneyflow_api_totals_nonzero(mf_cur):
+                continue
+            vn_flat = _get_moneyflow(symbol, days=total_days)
+            vn_payload = _vnstock_moneyflow_to_api_shape(vn_flat or {}, total_days)
+            if vn_payload:
+                out[symbol]["moneyFlow"] = vn_payload
+
     return JSONResponse(content={"data": out})
 
 
@@ -1917,109 +1890,32 @@ class handler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length).decode("utf-8") if content_length else "{}"
             payload = json.loads(body) if body.strip() else {}
             tickers = payload.get("tickers") or []
-            days = payload.get("days", 30)
         except Exception:
             tickers = []
-            days = 30
+            payload = {}
 
         unique = list({str(t).strip().upper() for t in tickers if t})
         path = (getattr(self, "path", "") or "").lower()
 
-        # Vercel/compat mode: hỗ trợ /api/moneyflow và /moneyflow
         if "moneyflow" in path:
+            raw_td = payload.get("days")
+            if raw_td is None:
+                raw_td = payload.get("totalDays")
             try:
-                days_int = int(days)
-            except Exception:
-                days_int = 30
-            days_int = days_int if days_int > 0 else 30
-
-            moneyflow: Dict[str, Dict[str, Optional[float]]] = {}
-            for symbol in unique:
-                try:
-                    mf = _get_moneyflow(symbol, days=days_int)
-                    moneyflow[symbol] = mf or {
-                        "foreignBuy": None,
-                        "foreignSell": None,
-                        "proprietaryBuy": None,
-                        "proprietarySell": None,
-                        "foreignRoomCurrent": None,
-                        "foreignRoomTotal": None,
-                        "foreignOwnership": None,
-                    }
-                except Exception:
-                    moneyflow[symbol] = {
-                        "foreignBuy": None,
-                        "foreignSell": None,
-                        "proprietaryBuy": None,
-                        "proprietarySell": None,
-                        "foreignRoomCurrent": None,
-                        "foreignRoomTotal": None,
-                        "foreignOwnership": None,
-                    }
-
-            out = json.dumps({"data": moneyflow}, ensure_ascii=False)
-        else:
-            data: Dict[str, Dict[str, Optional[float]]] = {}
-            for symbol in unique:
-                try:
-                    item = _extract_for_sources(symbol, SOURCES)
-                    if any(x is not None for x in item.values()):
-                        data[symbol] = item
-                except Exception:
-                    continue
-
-            out = json.dumps({"data": data}, ensure_ascii=False)
-
-        # Vercel handler: phân nhánh theo path để hỗ trợ nhiều API.
-        if "moneyflow" in str(getattr(self, "path", "")).lower():
-            try:
-                total_days = int(payload.get("totalDays") or 30)
-                trend_sessions = int(payload.get("trendSessions") or 20)
+                total_days = int(raw_td or 30)
             except Exception:
                 total_days = 30
+            total_days = max(1, total_days)
+            try:
+                trend_sessions = int(payload.get("trendSessions") or 20)
+            except Exception:
                 trend_sessions = 20
+            trend_sessions = max(1, trend_sessions)
 
-            consumer_id, consumer_secret = _ssi_env_consumer_credentials()
-            ssi_base_url = os.environ.get("SSI_FC_BASE_URL", "https://fc-data.ssi.com.vn")
-            token = _ssi_get_access_token(
-                base_url=ssi_base_url,
-                consumer_id=consumer_id,
-                consumer_secret=consumer_secret,
+            out_data, debug = _build_moneyflow_response(unique, total_days, trend_sessions)
+            out_json = json.dumps(
+                {"data": out_data, "_debug": debug}, ensure_ascii=False
             )
-            if not token:
-                out = {"data": {}}
-                out_json = json.dumps(out, ensure_ascii=False)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(out_json.encode("utf-8"))
-                return
-
-            out: Dict[str, Any] = {}
-            if unique:
-                workers = min(8, max(1, len(unique)))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(
-                            _compute_money_flow_for_symbol,
-                            symbol,
-                            total_days,
-                            trend_sessions,
-                            ssi_base_url,
-                            token,
-                        ): symbol
-                        for symbol in unique
-                    }
-                    for fut, symbol in futures.items():
-                        try:
-                            res = fut.result(timeout=90)
-                            if res:
-                                out[symbol] = res
-                        except Exception:
-                            continue
-
-            out_json = json.dumps({"data": out}, ensure_ascii=False)
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -2036,6 +1932,7 @@ class handler(BaseHTTPRequestHandler):
             except Exception:
                 continue
 
+        out = json.dumps({"data": data}, ensure_ascii=False)
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
