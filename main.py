@@ -107,10 +107,16 @@ app.add_middleware(
 class FundamentalsRequest(BaseModel):
     tickers: List[str] = []
 
-class MoneyflowRequest(BaseModel):
+
+class MoneyFlowRequest(BaseModel):
     tickers: List[str] = []
-    # Số ngày gần nhất để tổng hợp giao dịch khối ngoại/tự doanh
-    days: Optional[int] = 30
+    # Tổng hợp KN/TD theo số ngày lịch gần nhất (mặc định 30).
+    totalDays: int = 30
+    # Chuỗi net theo phiên (mặc định 20 phiên gần nhất).
+    trendSessions: int = 20
+    # Alias cũ (một số client gửi `days` thay cho totalDays).
+    days: Optional[int] = None
+
 
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
 _RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
@@ -395,26 +401,165 @@ def _get_trading_flow(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[float]]]:
-    """
-    Lấy khối ngoại/tự doanh (mua/bán) trên một cửa sổ ngày gần nhất.
+def _df_sum_columns(df: Any, names: tuple) -> Optional[float]:
+    """Cộng các cột có trong DataFrame; trả None nếu không có cột nào khớp."""
+    if df is None or not hasattr(df, "columns"):
+        return None
+    cols = getattr(df, "columns", None)
+    if cols is None:
+        return None
+    acc = 0.0
+    hit = False
+    for n in names:
+        if n in cols:
+            try:
+                acc += float(df[n].sum())
+                hit = True
+            except Exception:
+                pass
+    return acc if hit else None
 
-    Response fields:
-      - foreignBuy, foreignSell (giá trị mua/bán ròng theo NĐTNN)
-      - proprietaryBuy, proprietarySell (giá trị mua/bán theo tự doanh)
-    """
+
+def _infer_foreign_buy_sell(fr_df: Any) -> tuple[Optional[float], Optional[float]]:
+    """Chuẩn hoá nhiều kiểu đặt tên cột từ VCI/TCBS/vnstock_data."""
+    if fr_df is None or (hasattr(fr_df, "empty") and fr_df.empty):
+        return None, None
+    if isinstance(fr_df, dict):
+        fb = _safe_float(
+            fr_df.get("fr_buy_value")
+            or fr_df.get("foreign_buy_value")
+            or fr_df.get("buy_value")
+        )
+        fs = _safe_float(
+            fr_df.get("fr_sell_value")
+            or fr_df.get("foreign_sell_value")
+            or fr_df.get("sell_value")
+        )
+        return fb, fs
+    if not hasattr(fr_df, "columns"):
+        return None, None
+    fb = _df_sum_columns(fr_df, ("fr_buy_value", "foreign_buy_value", "buy_value"))
+    if fb is None:
+        fb = _df_sum_columns(fr_df, ("fr_buy_value_matched", "fr_buy_value_deal"))
+    fs = _df_sum_columns(fr_df, ("fr_sell_value", "foreign_sell_value", "sell_value"))
+    if fs is None:
+        fs = _df_sum_columns(fr_df, ("fr_sell_value_matched", "fr_sell_value_deal"))
+    return _safe_float(fb), _safe_float(fs)
+
+
+def _extract_moneyflow_from_trading(trading: Any, start_str: str, end_str: str) -> Dict[str, Optional[float]]:
+    """Đọc một instance Trading (vnstock_data) đã khởi tạo."""
     out: Dict[str, Optional[float]] = {
         "foreignBuy": None,
         "foreignSell": None,
         "proprietaryBuy": None,
         "proprietarySell": None,
-        # Room ngoại
+        "foreignRoomCurrent": None,
+        "foreignRoomTotal": None,
+        "foreignOwnership": None,
+    }
+    fr_df = None
+    try:
+        fr_df = trading.foreign_trade(start=start_str, end=end_str)
+    except Exception:
+        try:
+            fr_df = trading.foreign_trading(start=start_str, end=end_str)
+        except Exception:
+            fr_df = None
+
+    if fr_df is not None and not (hasattr(fr_df, "empty") and fr_df.empty):
+        fb, fs = _infer_foreign_buy_sell(fr_df)
+        out["foreignBuy"], out["foreignSell"] = fb, fs
+        if hasattr(fr_df, "columns"):
+            if "fr_current_room" in fr_df.columns:
+                out["foreignRoomCurrent"] = _safe_float(fr_df["fr_current_room"].iloc[-1])
+            if "fr_total_room" in fr_df.columns:
+                out["foreignRoomTotal"] = _safe_float(fr_df["fr_total_room"].iloc[-1])
+            if "fr_remaining_room" in fr_df.columns:
+                out["foreignRoomCurrent"] = out["foreignRoomCurrent"] or _safe_float(
+                    fr_df["fr_remaining_room"].iloc[-1]
+                )
+            if "fr_ownership" in fr_df.columns:
+                out["foreignOwnership"] = _safe_float(fr_df["fr_ownership"].iloc[-1])
+        elif isinstance(fr_df, dict):
+            out["foreignRoomCurrent"] = _safe_float(fr_df.get("fr_current_room") or fr_df.get("fr_remaining_room"))
+            out["foreignRoomTotal"] = _safe_float(fr_df.get("fr_total_room"))
+            out["foreignOwnership"] = _safe_float(fr_df.get("fr_ownership"))
+
+    prop_df = None
+    try:
+        prop_df = trading.prop_trade(start=start_str, end=end_str, resolution="1D")
+    except Exception:
+        try:
+            prop_df = trading.proprietary_trade(start=start_str, end=end_str)
+        except Exception:
+            prop_df = None
+
+    buy_candidates = (
+        "total_buy_trade_value",
+        "total_deal_buy_trade_value",
+        "buy_value",
+        "prop_buy_value",
+    )
+    sell_candidates = (
+        "total_sell_trade_value",
+        "total_deal_sell_trade_value",
+        "sell_value",
+        "prop_sell_value",
+    )
+
+    if prop_df is not None and not (hasattr(prop_df, "empty") and prop_df.empty):
+        if hasattr(prop_df, "columns"):
+            for col in buy_candidates:
+                if col in prop_df.columns:
+                    out["proprietaryBuy"] = _safe_float(prop_df[col].sum())
+                    break
+            for col in sell_candidates:
+                if col in prop_df.columns:
+                    out["proprietarySell"] = _safe_float(prop_df[col].sum())
+                    break
+        elif isinstance(prop_df, dict):
+            for col in buy_candidates:
+                v = prop_df.get(col)
+                if v is not None:
+                    out["proprietaryBuy"] = _safe_float(v)
+                    break
+            for col in sell_candidates:
+                v = prop_df.get(col)
+                if v is not None:
+                    out["proprietarySell"] = _safe_float(v)
+                    break
+
+    return out
+
+
+def _moneyflow_dict_has_values(m: Dict[str, Optional[float]]) -> bool:
+    for k in ("foreignBuy", "foreignSell", "proprietaryBuy", "proprietarySell"):
+        v = m.get(k)
+        if isinstance(v, (int, float)) and v == v and abs(float(v)) > 1e-9:
+            return True
+    return False
+
+
+def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[float]]]:
+    """
+    Lấy khối ngoại/tự doanh (mua/bán) trên một cửa sổ ngày gần nhất.
+
+    Response fields:
+      - foreignBuy, foreignSell (giá trị mua/bán theo NĐTNN)
+      - proprietaryBuy, proprietarySell (giá trị mua/bán tự doanh)
+    """
+    empty: Dict[str, Optional[float]] = {
+        "foreignBuy": None,
+        "foreignSell": None,
+        "proprietaryBuy": None,
+        "proprietarySell": None,
         "foreignRoomCurrent": None,
         "foreignRoomTotal": None,
         "foreignOwnership": None,
     }
     if _Trading is None:
-        return out
+        return empty
 
     try:
         from datetime import date, timedelta
@@ -423,101 +568,55 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
         start_d = end_d - timedelta(days=days)
         start_str = start_d.strftime("%Y-%m-%d")
         end_str = end_d.strftime("%Y-%m-%d")
-        
-        # Try multiple sources if VCI fails
-        sources = ["vci", "tcbs", "ssi"]
-        trading = None
-        
-        for src in sources:
+
+        merged = dict(empty)
+        for src in ("vci", "tcbs", "ssi"):
             try:
                 trading = _Trading(symbol=symbol, source=src)
-                break
             except Exception:
                 continue
-        
-        if trading is None:
-            return out
+            part = _extract_moneyflow_from_trading(trading, start_str, end_str)
+            for k, v in part.items():
+                if v is not None and (merged.get(k) is None):
+                    merged[k] = v
+            if _moneyflow_dict_has_values(merged):
+                break
 
-        # Khối ngoại
-        fr_df = None
-        try:
-            fr_df = trading.foreign_trade(start=start_str, end=end_str)
-        except Exception as e:
-            # Try alternative method if available
-            try:
-                fr_df = trading.foreign_trading(start=start_str, end=end_str)
-            except Exception:
-                fr_df = None
-
-        if fr_df is not None and not (hasattr(fr_df, "empty") and fr_df.empty):
-            if hasattr(fr_df, "columns"):
-                # Try multiple column name variations
-                buy_cols = ["fr_buy_value", "foreign_buy_value", "buy_value"]
-                sell_cols = ["fr_sell_value", "foreign_sell_value", "sell_value"]
-                
-                for col in buy_cols:
-                    if col in fr_df.columns:
-                        out["foreignBuy"] = _safe_float(fr_df[col].sum())
-                        break
-                
-                for col in sell_cols:
-                    if col in fr_df.columns:
-                        out["foreignSell"] = _safe_float(fr_df[col].sum())
-                        break
-                
-                if "fr_current_room" in fr_df.columns:
-                    out["foreignRoomCurrent"] = _safe_float(fr_df["fr_current_room"].iloc[-1])
-                if "fr_total_room" in fr_df.columns:
-                    out["foreignRoomTotal"] = _safe_float(fr_df["fr_total_room"].iloc[-1])
-                if "fr_ownership" in fr_df.columns:
-                    out["foreignOwnership"] = _safe_float(fr_df["fr_ownership"].iloc[-1])
-            elif isinstance(fr_df, dict):
-                out["foreignBuy"] = _safe_float(fr_df.get("fr_buy_value") or fr_df.get("foreign_buy_value"))
-                out["foreignSell"] = _safe_float(fr_df.get("fr_sell_value") or fr_df.get("foreign_sell_value"))
-                out["foreignRoomCurrent"] = _safe_float(fr_df.get("fr_current_room"))
-                out["foreignRoomTotal"] = _safe_float(fr_df.get("fr_total_room"))
-                out["foreignOwnership"] = _safe_float(fr_df.get("fr_ownership"))
-
-        # Tự doanh
-        prop_df = None
-        try:
-            prop_df = trading.prop_trade(start=start_str, end=end_str, resolution="1D")
-        except Exception:
-            # Try alternative method
-            try:
-                prop_df = trading.proprietary_trade(start=start_str, end=end_str)
-            except Exception:
-                prop_df = None
-
-        if prop_df is not None and not (hasattr(prop_df, "empty") and prop_df.empty):
-            # Ưu tiên cột tổng hợp theo "trade_value" (theo doc demo)
-            buy_candidates = ("total_buy_trade_value", "total_deal_buy_trade_value", "buy_value", "prop_buy_value")
-            sell_candidates = ("total_sell_trade_value", "total_deal_sell_trade_value", "sell_value", "prop_sell_value")
-
-            if hasattr(prop_df, "columns"):
-                for col in buy_candidates:
-                    if col in prop_df.columns:
-                        out["proprietaryBuy"] = _safe_float(prop_df[col].sum())
-                        break
-                for col in sell_candidates:
-                    if col in prop_df.columns:
-                        out["proprietarySell"] = _safe_float(prop_df[col].sum())
-                        break
-            elif isinstance(prop_df, dict):
-                for col in buy_candidates:
-                    v = prop_df.get(col)
-                    if v is not None:
-                        out["proprietaryBuy"] = _safe_float(v)
-                        break
-                for col in sell_candidates:
-                    v = prop_df.get(col)
-                    if v is not None:
-                        out["proprietarySell"] = _safe_float(v)
-                        break
-
-        return out
+        return merged
     except Exception:
-        return out
+        return empty
+
+
+def _vnstock_moneyflow_to_api_shape(
+    vn: Dict[str, Optional[float]], total_days: int
+) -> Optional[Dict[str, Any]]:
+    """Chuyển dict phẳng từ _get_moneyflow sang payload giống SSI (không có series)."""
+    if not vn:
+        return None
+    fb = int(round(float(vn.get("foreignBuy") or 0)))
+    fs = int(round(float(vn.get("foreignSell") or 0)))
+    pb = int(round(float(vn.get("proprietaryBuy") or 0)))
+    ps = int(round(float(vn.get("proprietarySell") or 0)))
+    if fb == 0 and fs == 0 and pb == 0 and ps == 0:
+        return None
+    return {
+        "foreignBuy": fb,
+        "foreignSell": fs,
+        "proprietaryBuy": pb,
+        "proprietarySell": ps,
+        "foreignNetSeries": None,
+        "proprietaryNetSeries": None,
+    }
+
+
+def _moneyflow_api_totals_nonzero(m: Optional[Dict[str, Any]]) -> bool:
+    if not m or not isinstance(m, dict):
+        return False
+    for k in ("foreignBuy", "foreignSell", "proprietaryBuy", "proprietarySell"):
+        v = m.get(k)
+        if isinstance(v, (int, float)) and v == v and abs(float(v)) > 1e-6:
+            return True
+    return False
 
 
 def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
