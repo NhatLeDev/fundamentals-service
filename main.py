@@ -1016,6 +1016,61 @@ def _normalize_vnindex_prices(prices: List[float]) -> List[float]:
     return prices
 
 
+def _yahoo_vnindex_volume_tail(n: int) -> Optional[List[float]]:
+    """Lấy n volume daily gần nhất từ Yahoo (cũ → mới), căn chỉnh với đuôi chuỗi giá."""
+    import urllib.request
+
+    n = max(1, int(n))
+    for yahoo_symbol in ("%5EVNINDEX", "VNINDEX.VN"):
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1d&range=2y"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0 (compatible; Vnstock/1.0)"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                import json as _json
+
+                data = _json.loads(resp.read().decode())
+            results = data.get("chart", {}).get("result") or []
+            if not results:
+                continue
+            quote = results[0].get("indicators", {}).get("quote") or [{}]
+            q0 = quote[0] if quote else {}
+            closes_raw = q0.get("close") or []
+            vols_raw = q0.get("volume") or []
+            vols: List[float] = []
+            for i, c in enumerate(closes_raw):
+                if c is None or not isinstance(c, (int, float)):
+                    continue
+                vv = (
+                    float(vols_raw[i])
+                    if i < len(vols_raw) and isinstance(vols_raw[i], (int, float))
+                    else 0.0
+                )
+                vols.append(vv)
+            if len(vols) >= n:
+                return vols[-n:]
+        except Exception:
+            continue
+    return None
+
+
+def _merge_volumes_if_all_zero(bars: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    """
+    Nhiều nguồn vnstock trả VNINDEX không có volume (toàn 0) → thanh khoản N/A.
+    Ghép volume theo cùng độ dài từ Yahoo (cùng thứ tự cuối chuỗi).
+    """
+    if not bars:
+        return bars
+    total_v = sum(float(b.get("volume") or 0.0) for b in bars)
+    if total_v > 1e-3:
+        return bars
+    ytail = _yahoo_vnindex_volume_tail(len(bars))
+    if not ytail or len(ytail) != len(bars):
+        return bars
+    return [{"close": float(b["close"]), "volume": float(ytail[i])} for i, b in enumerate(bars)]
+
+
 def _normalize_vnindex_bars(bars: List[Dict[str, float]]) -> List[Dict[str, float]]:
     closes = [b["close"] for b in bars]
     closes_n = _normalize_vnindex_prices(closes)
@@ -1231,15 +1286,17 @@ def _compute_vn30_above_ma200_breadth() -> Dict[str, Any]:
 
 def _volume_today_vs_avg20(bars: List[Dict[str, float]]) -> Dict[str, Any]:
     vols = [b.get("volume") or 0.0 for b in bars]
-    if len(vols) < 21:
+    if len(vols) < 2:
         return {
             "volume_today": None,
             "volume_avg20": None,
             "volume_vs_avg20_pct": None,
         }
     today_v = vols[-1]
-    prev20 = vols[-21:-1]
-    avg20 = sum(prev20) / len(prev20) if prev20 else None
+    prev_slice = vols[-21:-1] if len(vols) >= 21 else vols[:-1]
+    avg20 = (
+        sum(prev_slice) / len(prev_slice) if prev_slice else None
+    )
     if avg20 is not None and avg20 <= 0:
         avg20 = None
     vs_pct: Optional[float] = None
@@ -1266,6 +1323,7 @@ def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
         stale = _cache_get(_vnindex_cache, cache_key, include_expired=True)
         return stale
 
+    bars = _merge_volumes_if_all_zero(bars)
     bars = _normalize_vnindex_bars(bars)
     prices = [b["close"] for b in bars]
     last = prices[-1]
