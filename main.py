@@ -1677,6 +1677,12 @@ def _ssi_fc_item_close_volume(it: Dict[str, Any]) -> tuple[Optional[float], floa
         "MatchedPrice",
         "MatchPrice",
         "ClosingPrice",
+        "MatClose",
+        "matClose",
+        "CloseIndex",
+        "closeIndex",
+        "IndexClose",
+        "indexClose",
     ):
         if k in it:
             close = _parse_sci_float(it.get(k))
