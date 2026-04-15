@@ -843,8 +843,189 @@ def _yahoo_fetch_vnindex_bars(days: int) -> Optional[List[Dict[str, float]]]:
     return pool[0]
 
 
+def _vnindex_prefer_domestic() -> bool:
+    """
+    Bật: SSI FastConnect → vnstock → Yahoo → Robot (khớp chỉ số HOSE / nguồn trong nước).
+    Tắt (mặc định): Yahoo trước — ổn khi không có SSI_FC_* / vnstock.
+    """
+    return str(os.environ.get("VNINDEX_PREFER_DOMESTIC", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _vnindex_bars_try_robotstock(days: int) -> Optional[List[Dict[str, float]]]:
+    try:
+        import urllib.request
+
+        rkey = os.environ.get("ROBOTSTOCK_API_KEY", "demo")
+        url = f"https://api.robotstock.info.vn/api_data?type=his_stock&sym=VNINDEX&key={rkey}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            import json as _json
+
+            rows = _json.loads(resp.read().decode())
+        if not isinstance(rows, list) or len(rows) < 20:
+            return None
+        sorted_rows = sorted(rows, key=lambda r: r.get("Date", ""))
+        bars_rs: List[Dict[str, float]] = []
+        for r in sorted_rows:
+            c = r.get("Close") or r.get("close")
+            vol_raw = r.get("Volume") or r.get("volume") or r.get("Vol") or 0
+            if c is None:
+                continue
+            try:
+                close_v = float(c)
+                vol_v = float(vol_raw) if vol_raw not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                continue
+            if close_v > 0 and close_v < 1e15:
+                bars_rs.append({"close": close_v, "volume": vol_v})
+        if len(bars_rs) < 20:
+            return None
+        if max(b["close"] for b in bars_rs) > 5000:
+            for b in bars_rs:
+                b["close"] /= 50.0
+        return bars_rs[-days:] if len(bars_rs) > days else bars_rs
+    except Exception:
+        return None
+
+
+def _vnindex_bars_try_vnstock_paths(
+    days: int,
+    skip_vn: bool,
+    stale_any: Optional[List[Dict[str, float]]],
+    bars_from_df: Any,
+    on_quota_exit: Any,
+) -> tuple[Optional[List[Dict[str, float]]], bool]:
+    """
+    Thử toàn bộ nhánh vnstock cho VNINDEX.
+    Trả về (bars, True) nếu caller nên return stale_any (quota + có stale).
+    """
+    if skip_vn:
+        return None, False
+
+    if Quote is not None:
+        for source in ("KBS", "TCBS", "DNSE"):
+            if not _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                break
+            try:
+                quote = Quote(symbol="VNINDEX", source=source)
+                df = _vnstock_safe_quote_history(quote, length="1Y", interval="1D")
+                if df is None:
+                    on_quota_exit()
+                    if stale_any is not None:
+                        return None, True
+                    break
+                _vnstock_limiter.record_call()
+                bars = bars_from_df(df)
+                if bars:
+                    return bars, False
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "rate limit" in error_msg or "too many" in error_msg:
+                    _vnstock_limiter.set_rate_limited(60)
+                    if stale_any is not None:
+                        return None, True
+                    break
+                continue
+        try:
+            from datetime import date, timedelta
+
+            end_d = date.today()
+            start_d = end_d - timedelta(days=days * 2)
+            if _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                quote = Quote(symbol="VNINDEX", source="KBS")
+                df = _vnstock_safe_quote_history(
+                    quote,
+                    start=start_d.strftime("%Y-%m-%d"),
+                    end=end_d.strftime("%Y-%m-%d"),
+                    interval="1D",
+                )
+                if df is None:
+                    on_quota_exit()
+                else:
+                    _vnstock_limiter.record_call()
+                    bars = bars_from_df(df)
+                    if bars:
+                        return bars, False
+        except Exception:
+            pass
+
+    if get_index_series is not None and _vnstock_limiter.wait_if_needed(max_wait=3.0):
+        try:
+            try:
+                df = get_index_series(index_code="VNINDEX", time_range="OneYear")
+            except SystemExit:
+                df = None
+                on_quota_exit()
+            if df is not None:
+                _vnstock_limiter.record_call()
+                bars = bars_from_df(df)
+                if bars:
+                    return bars, False
+        except Exception:
+            pass
+
+    if stock_historical_data is not None:
+        try:
+            from datetime import date, timedelta
+
+            end_d = date.today()
+            start_d = end_d - timedelta(days=days * 2)
+            start_str = start_d.strftime("%Y-%m-%d")
+            end_str = end_d.strftime("%Y-%m-%d")
+            if _vnstock_limiter.wait_if_needed(max_wait=3.0):
+                for kwargs in [
+                    {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str, "type": "index"},
+                    {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str},
+                ]:
+                    try:
+                        try:
+                            df = stock_historical_data(**kwargs)
+                        except SystemExit:
+                            df = None
+                            on_quota_exit()
+                        if df is None:
+                            continue
+                        _vnstock_limiter.record_call()
+                        bars = bars_from_df(df)
+                        if bars:
+                            return bars, False
+                    except TypeError:
+                        try:
+                            try:
+                                df = stock_historical_data("VNINDEX", start_str, end_str)
+                            except SystemExit:
+                                df = None
+                                on_quota_exit()
+                            if df is None:
+                                continue
+                            _vnstock_limiter.record_call()
+                            bars = bars_from_df(df)
+                            if bars:
+                                return bars, False
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return None, False
+
+
 def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
-    """Chuỗi nến daily VN-Index (cũ → mới): close, volume (0 nếu nguồn không có)."""
+    """
+    Chuỗi nến daily VN-Index (cũ → mới): close, volume (0 nếu nguồn không có).
+
+    Thứ tự nguồn:
+    - Mặc định: Yahoo → SSI FC → Robotstock → vnstock (Render không cần credential).
+    - VNINDEX_PREFER_DOMESTIC=1: SSI FC → vnstock → Yahoo → Robot (khớp chỉ số HOSE hơn;
+      cần SSI_FC_CONSUMER_ID/SECRET hoặc vnstock hoạt động).
+    """
     if days <= 0:
         days = 260
     
@@ -856,16 +1037,25 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
 
     stale_any = _cache_get(_vnindex_cache, cache_key, include_expired=True)
 
-    # Đang cooldown vnstock: vẫn thử Yahoo / SSI (không đụng quota vnai).
+    def _save_return(bars: List[Dict[str, float]]) -> List[Dict[str, float]]:
+        _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
+        return bars
+
+    prefer_domestic = _vnindex_prefer_domestic()
+
+    # Đang cooldown vnstock: vẫn thử SSI / Yahoo (không đụng quota vnai).
     if _vnstock_limiter.is_rate_limited():
+        if prefer_domestic:
+            bars_s = _ssi_vnindex_bars_from_fastconnect(days)
+            if bars_s:
+                return _save_return(bars_s)
         bars_y = _yahoo_fetch_vnindex_bars(days)
         if bars_y:
-            _cache_set(_vnindex_cache, cache_key, bars_y, _VNINDEX_CACHE_TTL_SECONDS)
-            return bars_y
-        bars_s = _ssi_vnindex_bars_from_fastconnect(days)
-        if bars_s:
-            _cache_set(_vnindex_cache, cache_key, bars_s, _VNINDEX_CACHE_TTL_SECONDS)
-            return bars_s
+            return _save_return(bars_y)
+        if not prefer_domestic:
+            bars_s = _ssi_vnindex_bars_from_fastconnect(days)
+            if bars_s:
+                return _save_return(bars_s)
         return stale_any
 
     skip_vn = str(os.environ.get("VNINDEX_BARS_SKIP_VNSTOCK", "0")).strip().lower() in (
@@ -905,169 +1095,49 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
     def _on_vnstock_quota_exit() -> None:
         _vnstock_limiter.set_rate_limited(90)
 
-    # 1) Yahoo — ưu tiên: ổn định trên Render, không quota vnstock/vnai
+    if prefer_domestic:
+        # SSI FastConnect → vnstock → Yahoo → Robot (chỉ số gần HOSE / trong nước)
+        bars_fc = _ssi_vnindex_bars_from_fastconnect(days)
+        if bars_fc:
+            return _save_return(bars_fc)
+        vbars, need_stale = _vnindex_bars_try_vnstock_paths(
+            days, skip_vn, stale_any, _bars_from_df, _on_vnstock_quota_exit
+        )
+        if need_stale:
+            return stale_any
+        if vbars:
+            return _save_return(vbars)
+        bars_yahoo = _yahoo_fetch_vnindex_bars(days)
+        if bars_yahoo:
+            return _save_return(bars_yahoo)
+        bars_robot = _vnindex_bars_try_robotstock(days)
+        if bars_robot:
+            return _save_return(bars_robot)
+        return stale_any
+
+    # Mặc định: Yahoo (ổn trên cloud không SSI) → SSI → Robot → vnstock
     bars_yahoo = _yahoo_fetch_vnindex_bars(days)
     if bars_yahoo:
-        _cache_set(_vnindex_cache, cache_key, bars_yahoo, _VNINDEX_CACHE_TTL_SECONDS)
-        return bars_yahoo
+        return _save_return(bars_yahoo)
 
-    # 2) SSI FastConnect DailyStockPrice (symbol VNINDEX) — nếu có SSI_FC_* env
     bars_fc = _ssi_vnindex_bars_from_fastconnect(days)
     if bars_fc:
-        _cache_set(_vnindex_cache, cache_key, bars_fc, _VNINDEX_CACHE_TTL_SECONDS)
-        return bars_fc
+        return _save_return(bars_fc)
 
-    # 3) Robotstock
-    try:
-        import urllib.request
+    bars_robot = _vnindex_bars_try_robotstock(days)
+    if bars_robot:
+        return _save_return(bars_robot)
 
-        rkey = os.environ.get("ROBOTSTOCK_API_KEY", "demo")
-        url = f"https://api.robotstock.info.vn/api_data?type=his_stock&sym=VNINDEX&key={rkey}"
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            import json as _json
-
-            rows = _json.loads(resp.read().decode())
-        if isinstance(rows, list) and len(rows) >= 20:
-            sorted_rows = sorted(rows, key=lambda r: r.get("Date", ""))
-            bars_rs: List[Dict[str, float]] = []
-            for r in sorted_rows:
-                c = r.get("Close") or r.get("close")
-                vol_raw = r.get("Volume") or r.get("volume") or r.get("Vol") or 0
-                if c is None:
-                    continue
-                try:
-                    close_v = float(c)
-                    vol_v = float(vol_raw) if vol_raw not in (None, "") else 0.0
-                except (TypeError, ValueError):
-                    continue
-                if close_v > 0 and close_v < 1e15:
-                    bars_rs.append({"close": close_v, "volume": vol_v})
-            if len(bars_rs) >= 20:
-                if max(b["close"] for b in bars_rs) > 5000:
-                    for b in bars_rs:
-                        b["close"] /= 50.0
-                out_rs = bars_rs[-days:] if len(bars_rs) > days else bars_rs
-                _cache_set(_vnindex_cache, cache_key, out_rs, _VNINDEX_CACHE_TTL_SECONDS)
-                return out_rs
-    except Exception:
-        pass
-
-    # 4) vnstock — cuối (tốn quota vnai; có thể sys.exit). Tắt: VNINDEX_BARS_SKIP_VNSTOCK=1
     if skip_vn:
         return stale_any
 
-    if Quote is not None:
-        for source in ("KBS", "TCBS", "DNSE"):
-            if not _vnstock_limiter.wait_if_needed(max_wait=3.0):
-                break
-            try:
-                quote = Quote(symbol="VNINDEX", source=source)
-                df = _vnstock_safe_quote_history(quote, length="1Y", interval="1D")
-                if df is None:
-                    _on_vnstock_quota_exit()
-                    if stale_any:
-                        return stale_any
-                    break
-                _vnstock_limiter.record_call()
-                bars = _bars_from_df(df)
-                if bars:
-                    _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
-                    return bars
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "rate limit" in error_msg or "too many" in error_msg:
-                    _vnstock_limiter.set_rate_limited(60)
-                    if stale_any:
-                        return stale_any
-                    break
-                continue
-        try:
-            from datetime import date, timedelta
-
-            end_d = date.today()
-            start_d = end_d - timedelta(days=days * 2)
-            if _vnstock_limiter.wait_if_needed(max_wait=3.0):
-                quote = Quote(symbol="VNINDEX", source="KBS")
-                df = _vnstock_safe_quote_history(
-                    quote,
-                    start=start_d.strftime("%Y-%m-%d"),
-                    end=end_d.strftime("%Y-%m-%d"),
-                    interval="1D",
-                )
-                if df is None:
-                    _on_vnstock_quota_exit()
-                else:
-                    _vnstock_limiter.record_call()
-                    bars = _bars_from_df(df)
-                    if bars:
-                        _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
-                        return bars
-        except Exception:
-            pass
-
-    if get_index_series is not None and _vnstock_limiter.wait_if_needed(max_wait=3.0):
-        try:
-            try:
-                df = get_index_series(index_code="VNINDEX", time_range="OneYear")
-            except SystemExit:
-                df = None
-                _on_vnstock_quota_exit()
-            if df is not None:
-                _vnstock_limiter.record_call()
-                bars = _bars_from_df(df)
-                if bars:
-                    _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
-                    return bars
-        except Exception:
-            pass
-
-    if stock_historical_data is not None:
-        try:
-            from datetime import date, timedelta
-
-            end_d = date.today()
-            start_d = end_d - timedelta(days=days * 2)
-            start_str = start_d.strftime("%Y-%m-%d")
-            end_str = end_d.strftime("%Y-%m-%d")
-            if _vnstock_limiter.wait_if_needed(max_wait=3.0):
-                for kwargs in [
-                    {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str, "type": "index"},
-                    {"symbol": "VNINDEX", "start_date": start_str, "end_date": end_str},
-                ]:
-                    try:
-                        try:
-                            df = stock_historical_data(**kwargs)
-                        except SystemExit:
-                            df = None
-                            _on_vnstock_quota_exit()
-                        if df is None:
-                            continue
-                        _vnstock_limiter.record_call()
-                        bars = _bars_from_df(df)
-                        if bars:
-                            _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
-                            return bars
-                    except TypeError:
-                        try:
-                            try:
-                                df = stock_historical_data("VNINDEX", start_str, end_str)
-                            except SystemExit:
-                                df = None
-                                _on_vnstock_quota_exit()
-                            if df is None:
-                                continue
-                            _vnstock_limiter.record_call()
-                            bars = _bars_from_df(df)
-                            if bars:
-                                _cache_set(_vnindex_cache, cache_key, bars, _VNINDEX_CACHE_TTL_SECONDS)
-                                return bars
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+    vbars, need_stale = _vnindex_bars_try_vnstock_paths(
+        days, skip_vn, stale_any, _bars_from_df, _on_vnstock_quota_exit
+    )
+    if need_stale:
+        return stale_any
+    if vbars:
+        return _save_return(vbars)
 
     return stale_any
 
