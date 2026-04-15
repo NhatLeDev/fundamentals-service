@@ -764,47 +764,79 @@ def _vnstock_safe_quote_history(quote: Any, **kwargs: Any) -> Any:
         return None
 
 
-def _yahoo_fetch_vnindex_bars(days: int) -> Optional[List[Dict[str, float]]]:
-    """Yahoo Finance chart — không tốn quota vnstock."""
-    if days <= 0:
-        days = 260
+def _yahoo_try_symbol_vnindex_bars(
+    sym: str, days: int, rng: str
+) -> Optional[List[Dict[str, float]]]:
+    """Một lần gọi chart Yahoo cho một symbol + range."""
     import urllib.parse
     import urllib.request
 
-    rng = "5y" if days > 400 else "2y" if days > 220 else "1y"
-    for sym in ("^VNINDEX", "VNINDEX.VN"):
-        try:
-            enc = urllib.parse.quote(sym, safe="")
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}?interval=1d&range={rng}"
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"}
+    try:
+        enc = urllib.parse.quote(sym, safe="")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}?interval=1d&range={rng}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0 (compatible; Fundamentals/1.0)"}
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode())
+        results = data.get("chart", {}).get("result") or []
+        if not results:
+            return None
+        quote_block = results[0].get("indicators", {}).get("quote") or [{}]
+        q0 = quote_block[0] if quote_block else {}
+        closes_raw = q0.get("close") or []
+        vols_raw = q0.get("volume") or []
+        if not closes_raw:
+            return None
+        bars_y: List[Dict[str, float]] = []
+        for i, c in enumerate(closes_raw):
+            if c is None or not isinstance(c, (int, float)):
+                continue
+            vv = (
+                float(vols_raw[i])
+                if i < len(vols_raw) and isinstance(vols_raw[i], (int, float))
+                else 0.0
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode())
-            results = data.get("chart", {}).get("result") or []
-            if not results:
-                continue
-            quote_block = results[0].get("indicators", {}).get("quote") or [{}]
-            q0 = quote_block[0] if quote_block else {}
-            closes_raw = q0.get("close") or []
-            vols_raw = q0.get("volume") or []
-            if not closes_raw:
-                continue
-            bars_y: List[Dict[str, float]] = []
-            for i, c in enumerate(closes_raw):
-                if c is None or not isinstance(c, (int, float)):
-                    continue
-                vv = (
-                    float(vols_raw[i])
-                    if i < len(vols_raw) and isinstance(vols_raw[i], (int, float))
-                    else 0.0
-                )
-                bars_y.append({"close": float(c), "volume": vv})
-            if len(bars_y) >= 20:
-                return bars_y[-days:] if len(bars_y) > days else bars_y
-        except Exception:
-            continue
-    return None
+            bars_y.append({"close": float(c), "volume": vv})
+        if len(bars_y) < 20:
+            return None
+        return bars_y[-days:] if len(bars_y) > days else bars_y
+    except Exception:
+        return None
+
+
+def _yahoo_fetch_vnindex_bars(days: int) -> Optional[List[Dict[str, float]]]:
+    """
+    Yahoo Finance — thử ^VNINDEX và VNINDEX.VN (range 2y/1y/5y).
+    Hai mã đôi khi cho đóng cửa khác nhau; chọn chuỗi có last trong dải VN-Index
+    hợp lý và ưu tiên last cao hơn (tránh nhầm series ~1260 khi spot ~1800).
+    """
+    if days <= 0:
+        days = 260
+    if days > 400:
+        ranges = ("5y",)
+    elif days > 220:
+        ranges = ("2y", "1y", "5y")
+    else:
+        ranges = ("1y", "2y", "5y")
+    candidates: List[List[Dict[str, float]]] = []
+    for sym in ("^VNINDEX", "VNINDEX.VN"):
+        for rng in ranges:
+            bars = _yahoo_try_symbol_vnindex_bars(sym, days, rng)
+            if bars:
+                candidates.append(bars)
+    if not candidates:
+        return None
+
+    def _last(bs: List[Dict[str, float]]) -> float:
+        return float(bs[-1]["close"])
+
+    lo = float(os.environ.get("VNINDEX_YAHOO_PLAUSIBLE_MIN", "900"))
+    hi = float(os.environ.get("VNINDEX_YAHOO_PLAUSIBLE_MAX", "3200"))
+    plausible = [b for b in candidates if lo <= _last(b) <= hi]
+    pool = plausible if plausible else candidates
+    pool.sort(key=_last, reverse=True)
+    return pool[0]
 
 
 def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
