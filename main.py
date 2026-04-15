@@ -1107,6 +1107,39 @@ def _normalize_vnindex_prices(prices: List[float]) -> List[float]:
     return prices
 
 
+def _should_replace_vnindex_levels_with_yahoo(
+    backend_last: float, yahoo_last: float
+) -> bool:
+    """Giống logic reconcile trên Next: backend ~1260 vs Yahoo ~1800."""
+    try:
+        b = float(backend_last)
+        y = float(yahoo_last)
+    except (TypeError, ValueError):
+        return False
+    if not (900 <= y <= 3400):
+        return False
+    if b < 1350 and y > 1550:
+        return True
+    if y > b + max(40.0, 0.025 * b):
+        return True
+    if b > 3200 and y < b - 50.0:
+        return True
+    return False
+
+
+def _yahoo_vnindex_reference_last() -> Optional[float]:
+    """Đóng cửa gần nhất từ Yahoo (5d), max giữa ^VNINDEX và VNINDEX.VN trong dải hợp lý."""
+    best: Optional[float] = None
+    for sym in ("^VNINDEX", "VNINDEX.VN"):
+        bars = _yahoo_try_symbol_vnindex_bars(sym, 10, "5d")
+        if not bars:
+            continue
+        v = float(bars[-1]["close"])
+        if 900 <= v <= 3400 and (best is None or v > best):
+            best = v
+    return best
+
+
 def _yahoo_vnindex_volume_tail(n: int) -> Optional[List[float]]:
     """Lấy n volume daily gần nhất từ Yahoo (cũ → mới), căn chỉnh với đuôi chuỗi giá."""
     import urllib.request
@@ -1420,6 +1453,18 @@ def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
     last = prices[-1]
     if last < 100 or last > 5000:
         return None
+
+    # Robotstock / normalize đôi khi ~1260 trong khi Yahoo ~1800 — thay chuỗi nến Yahoo đầy đủ.
+    y_ref = _yahoo_vnindex_reference_last()
+    if y_ref is not None and _should_replace_vnindex_levels_with_yahoo(float(last), y_ref):
+        alt = _yahoo_fetch_vnindex_bars(260)
+        if alt and len(alt) >= 20:
+            bars = _merge_volumes_if_all_zero(alt)
+            bars = _normalize_vnindex_bars(bars)
+            prices = [b["close"] for b in bars]
+            last = prices[-1]
+            if last < 100 or last > 5000:
+                return None
 
     def sma(arr: List[float], period: int) -> Optional[float]:
         if len(arr) < period:
