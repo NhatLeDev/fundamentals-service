@@ -831,11 +831,15 @@ def _yahoo_fetch_vnindex_bars(days: int) -> Optional[List[Dict[str, float]]]:
     def _last(bs: List[Dict[str, float]]) -> float:
         return float(bs[-1]["close"])
 
+    def _max_c(bs: List[Dict[str, float]]) -> float:
+        return max(float(x["close"]) for x in bs)
+
     lo = float(os.environ.get("VNINDEX_YAHOO_PLAUSIBLE_MIN", "900"))
     hi = float(os.environ.get("VNINDEX_YAHOO_PLAUSIBLE_MAX", "3200"))
     plausible = [b for b in candidates if lo <= _last(b) <= hi]
     pool = plausible if plausible else candidates
-    pool.sort(key=_last, reverse=True)
+    # Ưu tiên chuỗi có đỉnh lịch sử cao (series ~1260 max ~1.3k; ~1800 max ~1.9k+).
+    pool.sort(key=lambda bs: (_max_c(bs), _last(bs)), reverse=True)
     return pool[0]
 
 
