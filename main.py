@@ -2207,11 +2207,7 @@ def api_market_batch(req: MarketBatchRequest):
     return JSONResponse(content={"data": out})
 
 
-def handler(req: BaseHTTPRequestHandler):
-    """Vercel gọi do_POST; req là self (BaseHTTPRequestHandler)."""
-    pass
-
-
+# Vercel: entry `handler` — subclass BaseHTTPRequestHandler (do_POST / do_OPTIONS).
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
