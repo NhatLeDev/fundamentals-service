@@ -1553,6 +1553,25 @@ def _compute_vnindex_overview() -> Optional[Dict[str, Any]]:
         last, ma20_val, ma50_val, ma200_val, sb, sa
     )
     vol_info = _volume_today_vs_avg20(bars)
+    # Yahoo / một số API index trả thanh khoản kiểu ~5M (không phải CP toàn sàn) — ẩn thay vì hiển thị sai.
+    try:
+        tv_raw = vol_info.get("volume_today")
+        thr = float(
+            os.environ.get("VNINDEX_INDEX_VOLUME_MIN_TRUST_SHARES", "40000000")
+        )
+        if (
+            last > 1500
+            and tv_raw is not None
+            and float(tv_raw) > 0
+            and float(tv_raw) < thr
+        ):
+            vol_info = {
+                "volume_today": None,
+                "volume_avg20": None,
+                "volume_vs_avg20_pct": None,
+            }
+    except (TypeError, ValueError):
+        pass
 
     breadth: Dict[str, Any] = {}
     try:

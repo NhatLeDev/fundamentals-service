@@ -19,6 +19,14 @@ VNSTOCK_MAX_CALLS_PER_MINUTE=10
 VNINDEX_PREFER_DOMESTIC=1
 ```
 
+### VN-Index: thanh khoản proxy (ẩn nếu quá thấp)
+
+```bash
+# Nếu last > 1500 mà volume_today < ngưỡng (mặc định 40 triệu) → coi là dữ liệu index proxy, trả null thay vì số sai.
+# Tăng/giảm tùy đơn vị nguồn (cổ phiếu vs lô). Đặt 0 để tắt kiểm tra.
+VNINDEX_INDEX_VOLUME_MIN_TRUST_SHARES=40000000
+```
+
 ### Cache TTLs (Time-to-Live in seconds)
 ```bash
 # VN-Index overview cache (5 minutes = 300 seconds)
