@@ -11,12 +11,11 @@ Add these to your deployment environment (Render, Vercel, etc.) or `.env` file:
 VNSTOCK_MAX_CALLS_PER_MINUTE=10
 ```
 
-### VN-Index: nguồn trong nước (HOSE) vs Yahoo (mặc định)
+### VN-Index: nguồn trong nước (HOSE) vs Yahoo
 
 ```bash
-# 1 = ưu tiên SSI FastConnect → vnstock → Yahoo → Robotstock (last / MA / RSI / volume gần sàn hơn).
-# 0 (mặc định) = Yahoo trước (ổn khi chưa cấu hình SSI_FC_*).
-# Cần SSI_FC_CONSUMER_ID + SSI_FC_CONSUMER_SECRET hoặc vnstock hoạt động; nếu không có vẫn fallback Yahoo.
+# Mặc định trong code = 1: SSI FastConnect → vnstock → Yahoo → Robotstock.
+# Đặt 0|false nếu môi trường chỉ dùng được Yahoo (không có SSI_FC_* và không muốn gọi vnstock trước).
 VNINDEX_PREFER_DOMESTIC=1
 ```
 

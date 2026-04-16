@@ -814,11 +814,11 @@ def _yahoo_fetch_vnindex_bars(days: int) -> Optional[List[Dict[str, float]]]:
     if days <= 0:
         days = 260
     if days > 400:
-        ranges = ("5y",)
+        ranges = ("10y", "5y")
     elif days > 220:
-        ranges = ("2y", "1y", "5y")
+        ranges = ("10y", "5y", "2y", "1y")
     else:
-        ranges = ("1y", "2y", "5y")
+        ranges = ("5y", "2y", "1y")
     candidates: List[List[Dict[str, float]]] = []
     for sym in ("^VNINDEX", "VNINDEX.VN"):
         for rng in ranges:
@@ -845,15 +845,13 @@ def _yahoo_fetch_vnindex_bars(days: int) -> Optional[List[Dict[str, float]]]:
 
 def _vnindex_prefer_domestic() -> bool:
     """
-    Bật: SSI FastConnect → vnstock → Yahoo → Robot (khớp chỉ số HOSE / nguồn trong nước).
-    Tắt (mặc định): Yahoo trước — ổn khi không có SSI_FC_* / vnstock.
+    Mặc định bật: SSI FC → vnstock → Yahoo → Robot (gần HOSE hơn).
+    Tắt: VNINDEX_PREFER_DOMESTIC=0|false — Yahoo trước (môi trường không gọi được SSI/vnstock).
     """
-    return str(os.environ.get("VNINDEX_PREFER_DOMESTIC", "0")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    v = str(os.environ.get("VNINDEX_PREFER_DOMESTIC", "1")).strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 def _vnindex_bars_try_robotstock(days: int) -> Optional[List[Dict[str, float]]]:
@@ -1022,9 +1020,8 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
     Chuỗi nến daily VN-Index (cũ → mới): close, volume (0 nếu nguồn không có).
 
     Thứ tự nguồn:
-    - Mặc định: Yahoo → SSI FC → Robotstock → vnstock (Render không cần credential).
-    - VNINDEX_PREFER_DOMESTIC=1: SSI FC → vnstock → Yahoo → Robot (khớp chỉ số HOSE hơn;
-      cần SSI_FC_CONSUMER_ID/SECRET hoặc vnstock hoạt động).
+    - Mặc định (VNINDEX_PREFER_DOMESTIC=1 hoặc unset): SSI FC → vnstock → Yahoo → Robot.
+    - VNINDEX_PREFER_DOMESTIC=0: Yahoo → SSI FC → Robot → vnstock.
     """
     if days <= 0:
         days = 260
