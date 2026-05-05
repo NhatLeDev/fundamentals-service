@@ -118,9 +118,19 @@ class MoneyFlowRequest(BaseModel):
     days: Optional[int] = None
 
 
-# Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,SSI,CAFE"
-_RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,SSI,CAFE")
-SOURCES = [s.strip() for s in _RAW_SOURCES.split(",") if s.strip()]
+# Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,VCI".
+# Lưu ý: vnstock 3.4+ chỉ hỗ trợ "KBS" và "VCI" cho Finance — các giá trị khác
+# (SSI / CAFE / TCBS / MSN) sẽ ném ValueError trong Finance.__init__ và bị catch
+# silently, dẫn đến /api/fundamentals trả về {"data":{}}.
+_VALID_FINANCE_SOURCES = {"KBS", "VCI"}
+_RAW_SOURCES = os.environ.get("VNSTOCK_SOURCE", "KBS,VCI")
+SOURCES = [
+    s.strip().upper()
+    for s in _RAW_SOURCES.split(",")
+    if s.strip() and s.strip().upper() in _VALID_FINANCE_SOURCES
+]
+if not SOURCES:
+    SOURCES = ["KBS", "VCI"]
 
 # Mặc định tắt field "nặng" để giảm số request/ticker khi dùng Guest plan.
 # Có thể bật lại bằng FUNDAMENTALS_ENABLE_HEAVY_FIELDS=1.
@@ -242,12 +252,16 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-# Map item_id từ vnstock ratio() -> field output (pe, pb, roe, eps)
+# Map item_id từ vnstock ratio() -> field output (pe, pb, roe, eps).
+# Lưu ý: vnstock 4.x (KBS source) trả `trailing_eps` thay vì `eps`.
+# KHÔNG map `roe_trailling` vào `roe` vì KBS có CẢ hai item_id và row trailling
+# thường rỗng cho kỳ hiện tại — sẽ ghi đè lên giá trị `roe` annual đúng.
 _ITEM_ID_TO_FIELD = {
     "pe": "pe", "pe_ratio": "pe", "p_e": "pe", "price_to_earning": "pe", "ty_le_pe": "pe",
     "pb": "pb", "pb_ratio": "pb", "p_b": "pb", "price_to_book": "pb", "ty_le_pb": "pb",
     "roe": "roe", "return_on_equity": "roe",
-    "eps": "eps", "earnings_per_share": "eps", "loi_nhuan_tren_co_phieu": "eps",
+    "eps": "eps", "trailing_eps": "eps", "earnings_per_share": "eps",
+    "loi_nhuan_tren_co_phieu": "eps",
 }
 
 # Map item_id từ cash_flow() -> field (dòng tiền: hoạt động kinh doanh, tăng/giảm tiền thuần)
@@ -326,7 +340,12 @@ def _parse_cash_flow_df(df) -> Dict[str, Optional[float]]:
 
 
 def _parse_ratio_df(df) -> Dict[str, Optional[float]]:
-    """Từ DataFrame ratio (mỗi hàng = một chỉ số), trích pe, pb, roe, eps từ cột kỳ mới nhất."""
+    """Từ DataFrame ratio (mỗi hàng = một chỉ số), trích pe, pb, roe, eps từ cột kỳ mới nhất.
+
+    First-non-None wins: nếu nhiều item_id cùng map vào 1 field (vd KBS có cả
+    `roe` và `roe_trailling`), giữ giá trị xuất hiện trước và bỏ qua row sau —
+    tránh trailling row rỗng ghi đè lên annual đúng.
+    """
     out: Dict[str, Optional[float]] = {"pe": None, "pb": None, "roe": None, "eps": None}
     meta = {"item", "item_id", "item_en", "unit", "levels", "row_number"}
     period_cols = [c for c in df.columns if c not in meta and str(c).strip()]
@@ -340,6 +359,8 @@ def _parse_ratio_df(df) -> Dict[str, Optional[float]]:
         field = _ITEM_ID_TO_FIELD.get(item_id)
         if not field or field not in out:
             continue
+        if out[field] is not None:
+            continue  # đã có giá trị từ row trước, không ghi đè
         val = row.get(latest_col)
         if val is None and len(period_cols) > 1:
             val = row.get(period_cols[1])
@@ -2146,6 +2167,58 @@ def api_moneyflow(req: MoneyFlowRequest):
     return JSONResponse(content={"data": out, "_debug": debug})
 
 
+@app.get("/api/debug/extract")
+def api_debug_extract(symbol: str, source: Optional[str] = None):
+    """
+    Endpoint chẩn đoán: chạy thử ratio()/overview()/cash_flow() cho 1 ticker và
+    trả về exception/data thật của từng nguồn — phục vụ debug Render khi
+    /api/fundamentals trả empty.
+
+    Ví dụ: GET /api/debug/extract?symbol=VNM
+           GET /api/debug/extract?symbol=VNM&source=KBS
+    """
+    import traceback as _tb
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return JSONResponse(content={"error": "symbol required"}, status_code=400)
+    sources_to_try = [source.strip().upper()] if source else list(SOURCES)
+    out: Dict[str, Any] = {
+        "symbol": sym,
+        "valid_finance_sources": sorted(_VALID_FINANCE_SOURCES),
+        "configured_SOURCES": SOURCES,
+        "sources_tried": sources_to_try,
+        "results": {},
+    }
+    for src in sources_to_try:
+        entry: Dict[str, Any] = {}
+        try:
+            df = _get_ratio_df(sym, src)
+            if df is None:
+                entry["ratio"] = "None (Finance/init or empty)"
+            elif hasattr(df, "empty") and df.empty:
+                entry["ratio"] = {"empty": True, "columns": list(df.columns)[:8]}
+            else:
+                ids = []
+                if "item_id" in df.columns:
+                    ids = df["item_id"].astype(str).tolist()[:60]
+                entry["ratio"] = {
+                    "shape": list(getattr(df, "shape", []) or []),
+                    "columns": list(df.columns)[:8],
+                    "item_ids": ids,
+                    "parsed": _parse_ratio_df(df),
+                }
+        except Exception as e:
+            entry["ratio_exception"] = f"{type(e).__name__}: {e}"
+            entry["traceback"] = _tb.format_exc(limit=5)
+        try:
+            row = _get_overview_row(sym, src)
+            entry["overview_keys"] = list(row.keys())[:30] if row else None
+        except Exception as e:
+            entry["overview_exception"] = f"{type(e).__name__}: {e}"
+        out["results"][src] = entry
+    return JSONResponse(content=out)
+
+
 @app.post("/api/fundamentals")
 @app.post("/fundamentals")
 @app.post("/")
@@ -2157,11 +2230,17 @@ def api_fundamentals(req: FundamentalsRequest):
         {"tickers": ["SSI", "MBB", ...]}
 
     Response:
-        {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...}}
+        {"data": {"SSI": {"pe", "pb", "roe", "eps"}, ...},
+         "_errors": {"TICKER": "ExceptionType: msg"}  # chỉ có khi có lỗi
+        }
+
+    Khi field không có nguồn nào trả số → ticker xuất hiện trong `_errors` với
+    note "all_sources_empty" để client phân biệt được "lỗi" vs "data thiếu".
     """
     tickers = req.tickers or []
     unique = list({str(t).strip().upper() for t in tickers if t})
     data: Dict[str, Dict[str, float]] = {}
+    errors: Dict[str, str] = {}
     for symbol in unique:
         cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
         cached = _cache_get(_fundamentals_cache, cache_key)
@@ -2180,9 +2259,17 @@ def api_fundamentals(req: FundamentalsRequest):
                     cleaned,
                     _FUNDAMENTALS_CACHE_TTL_SECONDS,
                 )
-        except Exception:
+            else:
+                errors[symbol] = f"all_sources_empty (tried: {','.join(SOURCES)})"
+                print(f"[fundamentals] {symbol}: all sources returned empty data", flush=True)
+        except Exception as e:
+            errors[symbol] = f"{type(e).__name__}: {str(e)[:200]}"
+            print(f"[fundamentals] {symbol} EXCEPTION: {type(e).__name__}: {e}", flush=True)
             continue
-    return JSONResponse(content={"data": data})
+    body: Dict[str, Any] = {"data": data}
+    if errors:
+        body["_errors"] = errors
+    return JSONResponse(content=body)
 
 
 class MarketBatchRequest(BaseModel):
@@ -2220,6 +2307,7 @@ def api_market_batch(req: MarketBatchRequest):
     }
 
     # 1) fundamentals
+    errors_f: Dict[str, str] = {}
     if include_f:
         for symbol in unique:
             cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
@@ -2238,7 +2326,12 @@ def api_market_batch(req: MarketBatchRequest):
                         cleaned,
                         _FUNDAMENTALS_CACHE_TTL_SECONDS,
                     )
-            except Exception:
+                else:
+                    errors_f[symbol] = f"all_sources_empty (tried: {','.join(SOURCES)})"
+                    print(f"[market-batch] {symbol}: all sources empty", flush=True)
+            except Exception as e:
+                errors_f[symbol] = f"{type(e).__name__}: {str(e)[:200]}"
+                print(f"[market-batch] {symbol} fundamentals EXCEPTION: {type(e).__name__}: {e}", flush=True)
                 continue
 
     # 2) moneyflow: SSI FastConnect (nếu có token) + fallback vnstock_data cho từng mã thiếu số liệu
@@ -2294,7 +2387,10 @@ def api_market_batch(req: MarketBatchRequest):
             if vn_payload:
                 out[symbol]["moneyFlow"] = vn_payload
 
-    return JSONResponse(content={"data": out})
+    body: Dict[str, Any] = {"data": out}
+    if errors_f:
+        body["_errors"] = {"fundamentals": errors_f}
+    return JSONResponse(content=body)
 
 
 # Vercel: entry `handler` — subclass BaseHTTPRequestHandler (do_POST / do_OPTIONS).
