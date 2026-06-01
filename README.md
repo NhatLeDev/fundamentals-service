@@ -41,6 +41,30 @@ cp .env.example .env
 | `VNSTOCK_SOURCE`  | Nguồn dữ liệu: `KBS` (mặc định) hoặc `VCI`.                                                                                                  |
 | `PORT`            | Render/Railway tự gán; không cần set thủ công.                                                                                               |
 
+### Chống timeout & rate limit (vnstock)
+
+Mọi call vnstock đều đi qua 1 rate limiter dùng chung + có ngân sách thời gian phía
+server, nên service luôn trả lời (kèm dữ liệu cache cũ nếu cần) thay vì để frontend
+timeout. Các biến điều chỉnh:
+
+| Biến                                | Mặc định | Ý nghĩa                                                                                              |
+| ----------------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `VNSTOCK_MAX_CALLS_PER_MINUTE`      | `30`     | Trần gọi upstream/phút. Có `VNSTOCK_API_KEY` (Community 60) → 30 an toàn. Guest (không key) → hạ 10. |
+| `FUNDAMENTALS_CACHE_TTL_SECONDS`    | `21600`  | TTL cache fundamentals (6h). PE/PB/ROE/EPS đổi theo quý nên cache dài để bớt gọi upstream.            |
+| `FUNDAMENTALS_TOTAL_BUDGET_SECONDS` | `18`     | Tổng thời gian server dành cho 1 request fundamentals. **Phải < abort 25s của frontend.**            |
+| `FUNDAMENTALS_PER_TICKER_TIMEOUT`   | `8`      | Timeout tối đa cho 1 mã trước khi rơi về cache cũ.                                                    |
+| `FUNDAMENTALS_FETCH_WORKERS`        | `4`      | Số mã fetch song song (đã được rate limiter gate nên không gây 429).                                  |
+| `MONEYFLOW_FUTURE_TIMEOUT`          | `18`     | Timeout mỗi mã cho luồng moneyflow.                                                                   |
+
+Hành vi khi quá tải/lỗi: nếu một mã timeout / bị rate limit / nguồn trả rỗng mà còn
+cache cũ → trả cache cũ kèm cờ `_stale: true`; worker vẫn chạy nền và tự làm ấm cache
+cho request kế tiếp (stale-while-revalidate).
+
+**Cold-start (Render free-tier):** instance ngủ sau ~15 phút idle → request đầu chờ
+~30–50s (vượt abort 25s) và cache rỗng. Khắc phục: ping `GET /health` định kỳ (~10
+phút) bằng cron ngoài (UptimeRobot / cron-job.org / GitHub Actions schedule) để giữ
+ấm, hoặc rời free-tier.
+
 ## 4. API
 
 ### POST `/fundamentals`

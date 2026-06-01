@@ -139,9 +139,24 @@ _ENABLE_HEAVY_FIELDS = (
     in ("1", "true", "yes", "on")
 )
 
+# Fundamentals (PE/PB/ROE/EPS theo năm) đổi theo quý → cache dài (mặc định 6h)
+# để giảm tải upstream và sống sót qua cold-start. Vẫn override được qua env.
 _FUNDAMENTALS_CACHE_TTL_SECONDS = max(
-    10, int(os.environ.get("FUNDAMENTALS_CACHE_TTL_SECONDS", "300"))
+    10, int(os.environ.get("FUNDAMENTALS_CACHE_TTL_SECONDS", "21600"))
 )
+
+# Ngân sách thời gian phía server, đặt DƯỚI mốc abort 25s của frontend
+# (market-api.ts) để luôn kịp trả lời (kèm stale cache) thay vì để client timeout.
+_FUNDAMENTALS_TOTAL_BUDGET_SECONDS = float(
+    os.environ.get("FUNDAMENTALS_TOTAL_BUDGET_SECONDS", "18")
+)
+_FUNDAMENTALS_PER_TICKER_TIMEOUT = float(
+    os.environ.get("FUNDAMENTALS_PER_TICKER_TIMEOUT", "8")
+)
+_FUNDAMENTALS_FETCH_WORKERS = max(
+    1, int(os.environ.get("FUNDAMENTALS_FETCH_WORKERS", "4"))
+)
+_MONEYFLOW_FUTURE_TIMEOUT = float(os.environ.get("MONEYFLOW_FUTURE_TIMEOUT", "18"))
 _MONEYFLOW_CACHE_TTL_SECONDS = max(
     10, int(os.environ.get("MONEYFLOW_CACHE_TTL_SECONDS", "120"))
 )
@@ -212,11 +227,34 @@ class VnstockRateLimiter:
         time.sleep(wait_time + 0.1)
         return True
 
-# Initialize rate limiter with conservative limit (50% of Guest tier for safety)
+# Initialize rate limiter. Mặc định 30/phút (an toàn dưới 60/phút của Community
+# tier khi đã set VNSTOCK_API_KEY). Guest tier nên set env về 10.
 _vnstock_limiter = VnstockRateLimiter(
-    max_calls=int(os.environ.get("VNSTOCK_MAX_CALLS_PER_MINUTE", "10")),
+    max_calls=int(os.environ.get("VNSTOCK_MAX_CALLS_PER_MINUTE", "30")),
     time_window=60
 )
+
+
+def _rl_call(func, *, label: str = "vnstock", max_wait: float = 3.0, cooldown: int = 60):
+    """Gọi 1 hàm vnstock qua rate limiter DÙNG CHUNG cho toàn service.
+
+    - Chờ tối đa `max_wait`s nếu sắp chạm limit; nếu phải chờ lâu hơn → raise
+      RuntimeError để caller bỏ qua call này và rơi về cache (tránh hammer upstream).
+    - Ghi nhận call thành công để limiter đếm chính xác.
+    - Phát hiện lỗi 'rate limit / too many / 429' → bật cooldown để các call sau
+      né upstream ngay, thay vì đập tiếp và bị khoá lâu hơn.
+    """
+    if not _vnstock_limiter.wait_if_needed(max_wait=max_wait):
+        raise RuntimeError(f"rate_limited_skip:{label}")
+    try:
+        result = func()
+        _vnstock_limiter.record_call()
+        return result
+    except Exception as e:
+        msg = str(e).lower()
+        if "rate limit" in msg or "too many" in msg or "429" in msg:
+            _vnstock_limiter.set_rate_limited(cooldown)
+        raise
 
 
 def _cache_get(cache: Dict[str, Dict[str, Any]], key: str, include_expired: bool = False) -> Optional[Any]:
@@ -240,6 +278,17 @@ def _cache_get(cache: Dict[str, Dict[str, Any]], key: str, include_expired: bool
 def _cache_set(cache: Dict[str, Dict[str, Any]], key: str, value: Any, ttl_seconds: int) -> None:
     with _cache_lock:
         cache[key] = {"value": value, "expires_at": time.time() + max(1, ttl_seconds)}
+
+
+def _cache_peek_fresh(cache: Dict[str, Dict[str, Any]], key: str) -> Optional[Any]:
+    """Trả value nếu còn hạn; KHÔNG xoá entry hết hạn (để stale-while-revalidate
+    còn dùng lại được). Khác với _cache_get vốn xoá entry hết hạn."""
+    now = time.time()
+    with _cache_lock:
+        entry = cache.get(key)
+        if not entry or entry.get("expires_at", 0) <= now:
+            return None
+        return entry.get("value")
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -286,9 +335,9 @@ def _get_ratio_df(symbol: str, source: str):
     try:
         finance = Finance(symbol=symbol, source=source)
         try:
-            df = finance.ratio(period="year", lang="vi")
+            df = _rl_call(lambda: finance.ratio(period="year", lang="vi"), label="ratio")
         except TypeError:
-            df = finance.ratio(period="year", display_mode="vi")
+            df = _rl_call(lambda: finance.ratio(period="year", display_mode="vi"), label="ratio")
     except Exception:
         return None
     if df is None or df.empty:
@@ -301,9 +350,9 @@ def _get_cash_flow_df(symbol: str, source: str):
     try:
         finance = Finance(symbol=symbol, source=source)
         try:
-            df = finance.cash_flow(period="year", lang="vi")
+            df = _rl_call(lambda: finance.cash_flow(period="year", lang="vi"), label="cash_flow")
         except TypeError:
-            df = finance.cash_flow(period="year", display_mode="vi")
+            df = _rl_call(lambda: finance.cash_flow(period="year", display_mode="vi"), label="cash_flow")
     except Exception:
         return None
     if df is None or df.empty:
@@ -385,7 +434,7 @@ def _get_trading_flow(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
         out: Dict[str, Any] = {}
         # Khối ngoại
         try:
-            fr_df = trading.foreign_trade(start=start_str, end=end_str)
+            fr_df = _rl_call(lambda: trading.foreign_trade(start=start_str, end=end_str), label="foreign_trade")
             if fr_df is not None and not (hasattr(fr_df, "empty") and fr_df.empty):
                 if hasattr(fr_df, "sum"):
                     s = fr_df.sum()
@@ -398,7 +447,7 @@ def _get_trading_flow(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
             pass
         # Tự doanh
         try:
-            prop_df = trading.prop_trade(start=start_str, end=end_str, resolution="1D")
+            prop_df = _rl_call(lambda: trading.prop_trade(start=start_str, end=end_str, resolution="1D"), label="prop_trade")
             if prop_df is not None and not (hasattr(prop_df, "empty") and prop_df.empty):
                 if hasattr(prop_df, "sum"):
                     s = prop_df.sum()
@@ -646,7 +695,7 @@ def _get_overview_row(symbol: str, source: str) -> Optional[Dict[str, Any]]:
             company = Company(symbol=symbol, source=source)
         except TypeError:
             company = Company(symbol=symbol)
-        df = company.overview()
+        df = _rl_call(lambda: company.overview(), label="overview")
     except Exception:
         return None
     if df is None or df.empty:
@@ -758,7 +807,7 @@ def _get_symbol_volume_ma(symbol: str, preferred_source: str, days: int = 120) -
     for src in sources:
         try:
             quote = Quote(symbol=symbol, source=src)
-            df = quote.history(length="1Y", interval="1D")
+            df = _rl_call(lambda: quote.history(length="1Y", interval="1D"), label="volume_ma")
             vols = _extract_volume(df)
             if not vols:
                 continue
@@ -2105,7 +2154,7 @@ def _build_moneyflow_response(
                 futures[fut] = (symbol, cache_key)
             for fut, (sym, cache_key) in futures.items():
                 try:
-                    res = fut.result(timeout=90)
+                    res = fut.result(timeout=_MONEYFLOW_FUTURE_TIMEOUT)
                     if res:
                         ssi_by_symbol[sym] = res
                         _cache_set(
@@ -2219,6 +2268,84 @@ def api_debug_extract(symbol: str, source: Optional[str] = None):
     return JSONResponse(content=out)
 
 
+def _fundamentals_worker(symbol: str, cache_key: str) -> Optional[Dict[str, Any]]:
+    """Fetch fundamentals cho 1 mã rồi tự cache khi thành công.
+
+    Tự cache ngay trong worker để thread nào về muộn (sau khi main thread đã hết
+    budget) vẫn làm ấm cache cho request kế tiếp — biến timeout thành cache-warm.
+    """
+    item = _extract_for_sources(symbol, SOURCES)
+    if any(v is not None for v in item.values()):
+        cleaned = {k: v for k, v in item.items() if v is not None}
+        _cache_set(_fundamentals_cache, cache_key, cleaned, _FUNDAMENTALS_CACHE_TTL_SECONDS)
+        return cleaned
+    return None
+
+
+def _fetch_fundamentals_map(
+    unique: List[str],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Lấy fundamentals cho nhiều mã: cache-first, fetch song song có giới hạn,
+    ràng buộc tổng budget < abort của frontend, và stale-while-revalidate.
+
+    Trả về (data, errors). Mã nào timeout/lỗi/empty mà còn cache cũ → trả cache cũ
+    (kèm cờ _stale) thay vì để trống; chỉ vào `errors` khi không có gì để trả.
+    """
+    data: Dict[str, Dict[str, Any]] = {}
+    errors: Dict[str, str] = {}
+    to_fetch: List[tuple] = []
+
+    for symbol in unique:
+        cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
+        # Peek không-xoá: giữ lại entry hết hạn để stale-while-revalidate dùng tiếp.
+        fresh = _cache_peek_fresh(_fundamentals_cache, cache_key)
+        if fresh is not None:
+            data[symbol] = fresh
+        else:
+            to_fetch.append((symbol, cache_key))
+
+    if not to_fetch:
+        return data, errors
+
+    def _fallback_stale(symbol: str, cache_key: str, reason: str) -> None:
+        stale = _cache_get(_fundamentals_cache, cache_key, include_expired=True)
+        if stale is not None:
+            data[symbol] = {**stale, "_stale": True}
+        else:
+            errors[symbol] = reason
+            print(f"[fundamentals] {symbol}: {reason}", flush=True)
+
+    deadline = time.time() + _FUNDAMENTALS_TOTAL_BUDGET_SECONDS
+    workers = min(_FUNDAMENTALS_FETCH_WORKERS, len(to_fetch))
+    # KHÔNG dùng `with ... as pool`: context-exit gọi shutdown(wait=True) sẽ chặn
+    # tới khi worker chậm chạy xong → phá vỡ ràng buộc budget. Tự shutdown(wait=False).
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(_fundamentals_worker, sym, ck): (sym, ck)
+            for sym, ck in to_fetch
+        }
+        for fut, (symbol, cache_key) in futures.items():
+            remaining = max(0.0, deadline - time.time())
+            # Luôn để 1 cửa sổ nhỏ để thu hoạch future đã xong dù budget đã cạn.
+            per_call = min(_FUNDAMENTALS_PER_TICKER_TIMEOUT, remaining) if remaining > 0 else 0.05
+            try:
+                cleaned = fut.result(timeout=per_call)
+                if cleaned:
+                    data[symbol] = cleaned
+                else:
+                    _fallback_stale(symbol, cache_key, f"all_sources_empty (tried: {','.join(SOURCES)})")
+            except Exception as e:
+                # Timeout (budget) / lỗi upstream / rate-limit-skip → stale-while-revalidate.
+                # Worker vẫn chạy nền và tự cache khi xong → làm ấm cho request kế tiếp.
+                _fallback_stale(symbol, cache_key, f"{type(e).__name__}: {str(e)[:160]}")
+    finally:
+        # wait=False: trả lời ngay; worker chậm chạy tiếp ở nền (đã được rate-limit gate).
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    return data, errors
+
+
 @app.post("/api/fundamentals")
 @app.post("/fundamentals")
 @app.post("/")
@@ -2239,33 +2366,7 @@ def api_fundamentals(req: FundamentalsRequest):
     """
     tickers = req.tickers or []
     unique = list({str(t).strip().upper() for t in tickers if t})
-    data: Dict[str, Dict[str, float]] = {}
-    errors: Dict[str, str] = {}
-    for symbol in unique:
-        cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
-        cached = _cache_get(_fundamentals_cache, cache_key)
-        if cached is not None:
-            data[symbol] = cached
-            continue
-        try:
-            item = _extract_for_sources(symbol, SOURCES)
-            if any(x is not None for x in item.values()):
-                # Loại bỏ None để tránh ResponseValidationError
-                cleaned = {k: v for k, v in item.items() if v is not None}
-                data[symbol] = cleaned
-                _cache_set(
-                    _fundamentals_cache,
-                    cache_key,
-                    cleaned,
-                    _FUNDAMENTALS_CACHE_TTL_SECONDS,
-                )
-            else:
-                errors[symbol] = f"all_sources_empty (tried: {','.join(SOURCES)})"
-                print(f"[fundamentals] {symbol}: all sources returned empty data", flush=True)
-        except Exception as e:
-            errors[symbol] = f"{type(e).__name__}: {str(e)[:200]}"
-            print(f"[fundamentals] {symbol} EXCEPTION: {type(e).__name__}: {e}", flush=True)
-            continue
+    data, errors = _fetch_fundamentals_map(unique)
     body: Dict[str, Any] = {"data": data}
     if errors:
         body["_errors"] = errors
@@ -2306,33 +2407,12 @@ def api_market_batch(req: MarketBatchRequest):
         t: {"fundamentals": None, "moneyFlow": None} for t in unique
     }
 
-    # 1) fundamentals
+    # 1) fundamentals (cache-first, song song có giới hạn, stale-while-revalidate)
     errors_f: Dict[str, str] = {}
     if include_f:
-        for symbol in unique:
-            cache_key = f"{symbol}|{','.join(SOURCES)}|heavy:{int(_ENABLE_HEAVY_FIELDS)}"
-            cached = _cache_get(_fundamentals_cache, cache_key)
-            if cached is not None:
-                out[symbol]["fundamentals"] = cached
-                continue
-            try:
-                item = _extract_for_sources(symbol, SOURCES)
-                if any(x is not None for x in item.values()):
-                    cleaned = {k: v for k, v in item.items() if v is not None}
-                    out[symbol]["fundamentals"] = cleaned
-                    _cache_set(
-                        _fundamentals_cache,
-                        cache_key,
-                        cleaned,
-                        _FUNDAMENTALS_CACHE_TTL_SECONDS,
-                    )
-                else:
-                    errors_f[symbol] = f"all_sources_empty (tried: {','.join(SOURCES)})"
-                    print(f"[market-batch] {symbol}: all sources empty", flush=True)
-            except Exception as e:
-                errors_f[symbol] = f"{type(e).__name__}: {str(e)[:200]}"
-                print(f"[market-batch] {symbol} fundamentals EXCEPTION: {type(e).__name__}: {e}", flush=True)
-                continue
+        f_data, errors_f = _fetch_fundamentals_map(unique)
+        for symbol, cleaned in f_data.items():
+            out[symbol]["fundamentals"] = cleaned
 
     # 2) moneyflow: SSI FastConnect (nếu có token) + fallback vnstock_data cho từng mã thiếu số liệu
     if include_m and unique:
@@ -2366,7 +2446,7 @@ def api_market_batch(req: MarketBatchRequest):
 
                 for fut, (symbol, cache_key) in futures.items():
                     try:
-                        res = fut.result(timeout=90)
+                        res = fut.result(timeout=_MONEYFLOW_FUTURE_TIMEOUT)
                         if res:
                             out[symbol]["moneyFlow"] = res
                             _cache_set(
@@ -2434,16 +2514,11 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(out_json.encode("utf-8"))
             return
 
-        data: Dict[str, Dict[str, Optional[float]]] = {}
-        for symbol in unique:
-            try:
-                item = _extract_for_sources(symbol, SOURCES)
-                if any(x is not None for x in item.values()):
-                    data[symbol] = item
-            except Exception:
-                continue
-
-        out = json.dumps({"data": data}, ensure_ascii=False)
+        data, errors = _fetch_fundamentals_map(unique)
+        body: Dict[str, Any] = {"data": data}
+        if errors:
+            body["_errors"] = errors
+        out = json.dumps(body, ensure_ascii=False)
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
