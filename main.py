@@ -118,6 +118,11 @@ class MoneyFlowRequest(BaseModel):
     days: Optional[int] = None
 
 
+class HistoryRequest(BaseModel):
+    tickers: List[str] = []
+    days: int = 260
+
+
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,VCI".
 # Lưu ý: vnstock 3.4+ chỉ hỗ trợ "KBS" và "VCI" cho Finance — các giá trị khác
 # (SSI / CAFE / TCBS / MSN) sẽ ném ValueError trong Finance.__init__ và bị catch
@@ -1745,6 +1750,44 @@ def api_vnindex_overview():
             content={"error": "Không lấy được dữ liệu VN-Index"},
             status_code=503
         )
+
+
+@app.post("/api/history")
+@app.post("/history")
+def api_history(req: HistoryRequest):
+    """Chuỗi giá lịch sử daily (close + volume), cũ → mới.
+
+    - **VNINDEX**: dùng `_get_vnindex_bars` (đa nguồn SSI FC / vnstock / Yahoo / Robot,
+      có cache + cooldown-aware) → bền hơn 1 nguồn Yahoo (vốn hay 429).
+    - **Mã lẻ**: `_get_equity_close_prices` (vnstock) — fallback khi Yahoo phía client lỗi.
+
+    Shape khớp client (market-api.ts fetchHistoricalDataViaBackend):
+    `{"data": {SYM: {"close": [...], "volume": [...]}}}`.
+    """
+    days = int(req.days or 260)
+    if days <= 0:
+        days = 260
+    out: Dict[str, Any] = {}
+    for raw in (req.tickers or []):
+        sym = str(raw).strip().upper()
+        if not sym:
+            continue
+        try:
+            if sym in ("VNINDEX", "^VNINDEX", "VN-INDEX", "VNI"):
+                bars = _get_vnindex_bars(days) or []
+                out["VNINDEX"] = {
+                    "close": [
+                        float(b["close"]) for b in bars if b.get("close") is not None
+                    ],
+                    "volume": [float(b.get("volume") or 0.0) for b in bars],
+                }
+            else:
+                closes = _get_equity_close_prices(sym, days) or []
+                out[sym] = {"close": [float(c) for c in closes], "volume": []}
+        except Exception as e:
+            print(f"[history] {sym} EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            continue
+    return JSONResponse(content={"data": out})
 
 
 def _ssi_env_consumer_credentials() -> tuple[Optional[str], Optional[str]]:
