@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -123,6 +124,10 @@ class HistoryRequest(BaseModel):
     days: int = 260
 
 
+class CompanyCatalystRequest(BaseModel):
+    tickers: List[str] = []
+
+
 # Có thể cấu hình nhiều nguồn, phân tách bằng dấu phẩy, ví dụ: "KBS,VCI".
 # Lưu ý: vnstock 3.4+ chỉ hỗ trợ "KBS" và "VCI" cho Finance — các giá trị khác
 # (SSI / CAFE / TCBS / MSN) sẽ ném ValueError trong Finance.__init__ và bị catch
@@ -176,6 +181,10 @@ _fundamentals_cache: Dict[str, Dict[str, Any]] = {}
 _moneyflow_cache: Dict[str, Dict[str, Any]] = {}
 _vnindex_cache: Dict[str, Dict[str, Any]] = {}
 _vn30_breadth_cache: Dict[str, Dict[str, Any]] = {}
+# Catalyst/ownership (news, events, shareholders, officers, insider) đổi chậm →
+# cache dài 6h/ticker. Khi rate-limited thì serve stale (include_expired=True).
+_company_catalyst_cache: Dict[str, Dict[str, Any]] = {}
+_COMPANY_CATALYST_CACHE_TTL_SECONDS = 21600
 
 # Rate limiter for vnstock API calls
 class VnstockRateLimiter:
@@ -1786,6 +1795,279 @@ def api_history(req: HistoryRequest):
                 out[sym] = {"close": [float(c) for c in closes], "volume": []}
         except Exception as e:
             print(f"[history] {sym} EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            continue
+    return JSONResponse(content={"data": out})
+
+
+def _catalyst_date_str(value: Any) -> Optional[str]:
+    """Coerce pandas Timestamp / datetime / str về 'YYYY-MM-DD' an toàn."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return None
+    if ts is None or pd.isna(ts):
+        return None
+    try:
+        return ts.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _catalyst_to_pct(value: Any, max_seen: float) -> Optional[float]:
+    """Chuẩn hoá own_percent về PHẦN TRĂM. Nhân 100 chỉ khi cả cột là fraction
+    (max <= 1.5), tránh nhân nhầm khi nguồn đã trả percent (vd 5.0)."""
+    v = _safe_float(value)
+    if v is None:
+        return None
+    if max_seen <= 1.5:
+        v = v * 100.0
+    return v
+
+
+def _catalyst_news(company) -> List[Dict[str, Any]]:
+    """Lên tới 5 tin mới nhất, chỉ giữ public_date trong vòng 60 ngày."""
+    try:
+        df = _rl_call(lambda: company.news(), label="catalyst_news")
+    except Exception as e:
+        print(f"[catalyst] news EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=60)
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        raw_date = row.get("public_date")
+        ts = pd.to_datetime(raw_date, errors="coerce")
+        if ts is None or pd.isna(ts) or ts.normalize() < cutoff:
+            continue
+        title = row.get("news_title")
+        title = str(title)[:200] if title is not None and not pd.isna(title) else None
+        src = row.get("news_source")
+        src = str(src) if src is not None and not pd.isna(src) else None
+        rows.append({
+            "title": title,
+            "date": _catalyst_date_str(raw_date),
+            "source": src,
+            "_sort": ts,
+        })
+    rows.sort(key=lambda r: r["_sort"], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for r in rows[:5]:
+        r.pop("_sort", None)
+        out.append(r)
+    return out
+
+
+def _catalyst_events(company) -> List[Dict[str, Any]]:
+    """Lên tới 6 sự kiện; ưu tiên record_date/exright_date trong tương lai HOẶC
+    trong vòng 30 ngày gần đây; sắp xếp theo public_date mới nhất trước."""
+    try:
+        df = _rl_call(lambda: company.events(), label="catalyst_events")
+    except Exception as e:
+        print(f"[catalyst] events EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    today = pd.Timestamp.now().normalize()
+    recent_cutoff = today - pd.Timedelta(days=30)
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        rec_ts = pd.to_datetime(row.get("record_date"), errors="coerce")
+        exr_ts = pd.to_datetime(row.get("exright_date"), errors="coerce")
+        relevant = False
+        for ts in (rec_ts, exr_ts):
+            if ts is not None and not pd.isna(ts):
+                d = ts.normalize()
+                if d >= recent_cutoff:  # tương lai hoặc trong 30 ngày gần đây
+                    relevant = True
+                    break
+        pub_ts = pd.to_datetime(row.get("public_date"), errors="coerce")
+        title = row.get("event_title_vi") or row.get("event_name_vi")
+        title = str(title)[:200] if title is not None and not pd.isna(title) else None
+        action = row.get("action_type_vi")
+        action = str(action) if action is not None and not pd.isna(action) else None
+        ratio = row.get("exercise_ratio")
+        ratio = str(ratio) if ratio is not None and not pd.isna(ratio) else None
+        rows.append({
+            "title": title,
+            "actionType": action,
+            "publicDate": _catalyst_date_str(row.get("public_date")),
+            "recordDate": _catalyst_date_str(row.get("record_date")),
+            "exrightDate": _catalyst_date_str(row.get("exright_date")),
+            "valuePerShare": _safe_float(row.get("value_per_share")),
+            "exerciseRatio": ratio,
+            "_relevant": relevant,
+            "_sort": pub_ts if (pub_ts is not None and not pd.isna(pub_ts)) else pd.Timestamp.min,
+        })
+    # Ưu tiên relevant trước, trong mỗi nhóm sắp theo public_date mới nhất.
+    rows.sort(key=lambda r: (r["_relevant"], r["_sort"]), reverse=True)
+    out: List[Dict[str, Any]] = []
+    for r in rows[:6]:
+        r.pop("_relevant", None)
+        r.pop("_sort", None)
+        out.append(r)
+    return out
+
+
+def _catalyst_ownership(company) -> Dict[str, Any]:
+    """top5Pct (tổng % của 5 cổ đông lớn nhất), officersPct (tổng % ban lãnh đạo),
+    topHolders (tối đa 5, sắp giảm dần). Mọi % chuẩn hoá về PHẦN TRĂM."""
+    out: Dict[str, Any] = {"top5Pct": None, "officersPct": None, "topHolders": []}
+    # Shareholders
+    try:
+        sdf = _rl_call(lambda: company.shareholders(), label="catalyst_shareholders")
+    except Exception as e:
+        print(f"[catalyst] shareholders EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        sdf = None
+    if sdf is not None and not getattr(sdf, "empty", True) and "share_own_percent" in sdf.columns:
+        pct_vals = [_safe_float(v) for v in sdf["share_own_percent"].tolist()]
+        pct_vals_clean = [v for v in pct_vals if v is not None]
+        max_seen = max(pct_vals_clean) if pct_vals_clean else 0.0
+        holders: List[Dict[str, Any]] = []
+        for _, row in sdf.iterrows():
+            name = row.get("share_holder")
+            name = str(name) if name is not None and not pd.isna(name) else None
+            pct = _catalyst_to_pct(row.get("share_own_percent"), max_seen)
+            if name is None or pct is None:
+                continue
+            holders.append({"name": name, "pct": pct})
+        holders.sort(key=lambda h: h["pct"], reverse=True)
+        top5 = holders[:5]
+        if top5:
+            out["top5Pct"] = round(sum(h["pct"] for h in top5), 2)
+        out["topHolders"] = [{"name": h["name"], "pct": round(h["pct"], 2)} for h in top5]
+    # Officers
+    try:
+        odf = _rl_call(lambda: company.officers(), label="catalyst_officers")
+    except Exception as e:
+        print(f"[catalyst] officers EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        odf = None
+    if odf is not None and not getattr(odf, "empty", True) and "officer_own_percent" in odf.columns:
+        opct_vals = [_safe_float(v) for v in odf["officer_own_percent"].tolist()]
+        opct_clean = [v for v in opct_vals if v is not None]
+        o_max = max(opct_clean) if opct_clean else 0.0
+        total = 0.0
+        any_val = False
+        for v in odf["officer_own_percent"].tolist():
+            p = _catalyst_to_pct(v, o_max)
+            if p is not None:
+                total += p
+                any_val = True
+        if any_val:
+            out["officersPct"] = round(total, 2)
+    return out
+
+
+def _catalyst_insider(company) -> List[Dict[str, Any]]:
+    """insider_trading() CHƯA verify → gọi phòng thủ; lỗi/rỗng → []. Tối đa 5 mới nhất."""
+    try:
+        df = _rl_call(lambda: company.insider_trading(), label="catalyst_insider")
+    except Exception as e:
+        print(f"[catalyst] insider EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return []
+    if df is None or getattr(df, "empty", True):
+        return []
+    try:
+        cols = {c.lower(): c for c in df.columns}
+        def pick(*names):
+            for n in names:
+                if n in cols:
+                    return cols[n]
+            return None
+        person_col = pick("person", "owner_name", "name", "share_holder", "officer_name")
+        action_col = pick("action", "action_type", "deal_type", "transaction", "type")
+        qty_col = pick("quantity", "volume", "shares", "deal_volume", "quantity_change")
+        date_col = pick("date", "public_date", "deal_date", "trade_date", "update_date")
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            ts = pd.to_datetime(row.get(date_col), errors="coerce") if date_col else None
+            rows.append({
+                "person": (str(row.get(person_col)) if person_col and row.get(person_col) is not None and not pd.isna(row.get(person_col)) else None),
+                "action": (str(row.get(action_col)) if action_col and row.get(action_col) is not None and not pd.isna(row.get(action_col)) else None),
+                "quantity": _safe_float(row.get(qty_col)) if qty_col else None,
+                "date": _catalyst_date_str(row.get(date_col)) if date_col else None,
+                "_sort": ts if (ts is not None and not pd.isna(ts)) else pd.Timestamp.min,
+            })
+        rows.sort(key=lambda r: r["_sort"], reverse=True)
+        out: List[Dict[str, Any]] = []
+        for r in rows[:5]:
+            r.pop("_sort", None)
+            out.append(r)
+        return out
+    except Exception as e:
+        print(f"[catalyst] insider PARSE EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        return []
+
+
+def _get_company_catalyst(symbol: str) -> Dict[str, Any]:
+    """News + events + ownership + insider của 1 mã (cache 6h, rate-limit guard).
+
+    Cache-first; nếu rate-limited thì serve stale (include_expired=True). Mỗi method
+    vnstock gọi qua _rl_call và bọc try/except riêng → một method lỗi không kéo đổ
+    cả response. Company is None (import fail) → trả shape rỗng graceful.
+    """
+    empty: Dict[str, Any] = {
+        "news": [],
+        "events": [],
+        "ownership": {"top5Pct": None, "officersPct": None, "topHolders": []},
+        "insiderTrading": [],
+    }
+
+    cache_key = symbol
+    cached = _cache_get(_company_catalyst_cache, cache_key)
+    if cached is not None:
+        return cached
+
+    if Company is None:
+        return empty
+
+    # Rate-limited → serve stale nếu có, tránh hammer upstream.
+    if _vnstock_limiter.is_rate_limited():
+        stale = _cache_get(_company_catalyst_cache, cache_key, include_expired=True)
+        if stale is not None:
+            return stale
+        return empty
+
+    try:
+        try:
+            company = Company(symbol=symbol, source="VCI")
+        except TypeError:
+            company = Company(symbol=symbol)
+    except Exception as e:
+        print(f"[catalyst] {symbol} Company init EXCEPTION: {type(e).__name__}: {e}", flush=True)
+        stale = _cache_get(_company_catalyst_cache, cache_key, include_expired=True)
+        return stale if stale is not None else empty
+
+    result: Dict[str, Any] = {
+        "news": _catalyst_news(company),
+        "events": _catalyst_events(company),
+        "ownership": _catalyst_ownership(company),
+        "insiderTrading": _catalyst_insider(company),
+    }
+
+    _cache_set(_company_catalyst_cache, cache_key, result, _COMPANY_CATALYST_CACHE_TTL_SECONDS)
+    return result
+
+
+@app.post("/api/company-catalyst")
+@app.post("/company-catalyst")
+def api_company_catalyst(req: CompanyCatalystRequest):
+    out: Dict[str, Any] = {}
+    for raw in (req.tickers or [])[:30]:   # cap 30 tickers
+        sym = str(raw).strip().upper()
+        if not sym:
+            continue
+        try:
+            out[sym] = _get_company_catalyst(sym)
+        except Exception as e:
+            print(f"[catalyst] {sym} EXCEPTION: {type(e).__name__}: {e}", flush=True)
             continue
     return JSONResponse(content={"data": out})
 
