@@ -1,0 +1,27 @@
+name: Keep Render service warm
+
+# Render free tier spins the service down after ~15 min of inactivity, and a
+# cold start takes ~45s — which blows the Vercel function budget on the caller.
+# This pings /health frequently so the instance stays awake.
+#
+# Cron is set to every 5 min on purpose: GitHub scheduled jobs are best-effort
+# and can be delayed several minutes under load, so 5 min leaves margin under
+# Render's ~15 min spin-down threshold.
+#
+# Note: GitHub auto-disables scheduled workflows after 60 days with no repo
+# commits. If pings stop, push any commit (or re-enable the workflow) to resume.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          curl -fsS --max-time 60 \
+            https://fundamentals-service.onrender.com/health \
+            && echo "OK: service responded"
