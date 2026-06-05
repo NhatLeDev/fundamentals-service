@@ -122,6 +122,7 @@ class MoneyFlowRequest(BaseModel):
 class HistoryRequest(BaseModel):
     tickers: List[str] = []
     days: int = 260
+    ohlc: bool = False
 
 
 class CompanyCatalystRequest(BaseModel):
@@ -1475,6 +1476,67 @@ def _get_equity_close_prices(symbol: str, days: int = 220) -> Optional[List[floa
     return None
 
 
+def _get_equity_ohlc(symbol: str, days: int = 260) -> Optional[Dict[str, List[Any]]]:
+    """Chuỗi nến daily đầy đủ (open/high/low/close/volume/time) cho 1 mã lẻ, cũ → mới.
+
+    Mirror `_get_equity_close_prices`: cùng thứ tự nguồn (KBS → TCBS → DNSE → VCI),
+    cùng try/except theo từng nguồn, nhưng trả về full OHLCV + time ("YYYY-MM-DD").
+    Bọc call qua `_rl_call` để dùng chung rate limiter của service.
+    """
+    if Quote is None:
+        return None
+    for source in ("KBS", "TCBS", "DNSE", "VCI"):
+        try:
+            quote = Quote(symbol=symbol, source=source)
+            df = _rl_call(
+                lambda: quote.history(length="1Y", interval="1D"),
+                label=f"equity_ohlc:{symbol}",
+            )
+            if df is None or (hasattr(df, "empty") and df.empty):
+                continue
+            if not (hasattr(df, "columns") and "close" in df.columns):
+                continue
+            closes = _safe_float_list(df["close"])
+            if len(closes) < 200:
+                continue
+            n = len(closes)
+
+            def _col(name: str) -> List[float]:
+                if name in df.columns:
+                    vals = _safe_float_list(df[name])
+                    if len(vals) == n:
+                        return vals
+                return [0.0] * n
+
+            opens = _col("open")
+            highs = _col("high")
+            lows = _col("low")
+            vols = _col("volume")
+
+            times: List[str] = []
+            if "time" in df.columns:
+                for value in list(df["time"]):
+                    ds = _catalyst_date_str(value)
+                    times.append(ds if ds is not None else "")
+            if len(times) != n:
+                times = [""] * n
+
+            def _tail(seq: List[Any]) -> List[Any]:
+                return seq[-days:] if len(seq) > days else seq
+
+            return {
+                "open": _tail(opens),
+                "high": _tail(highs),
+                "low": _tail(lows),
+                "close": _tail(closes),
+                "volume": _tail(vols),
+                "time": _tail(times),
+            }
+        except Exception:
+            continue
+    return None
+
+
 def _vn30_one_above_ma200(sym: str) -> Optional[bool]:
     """Check if a VN30 stock is above MA200 with caching."""
     # Check cache first (cache each symbol for 30 minutes since MA200 changes slowly)
@@ -1776,6 +1838,7 @@ def api_history(req: HistoryRequest):
     days = int(req.days or 260)
     if days <= 0:
         days = 260
+    want_ohlc = bool(req.ohlc)
     out: Dict[str, Any] = {}
     for raw in (req.tickers or []):
         sym = str(raw).strip().upper()
@@ -1784,12 +1847,39 @@ def api_history(req: HistoryRequest):
         try:
             if sym in ("VNINDEX", "^VNINDEX", "VN-INDEX", "VNI"):
                 bars = _get_vnindex_bars(days) or []
-                out["VNINDEX"] = {
-                    "close": [
-                        float(b["close"]) for b in bars if b.get("close") is not None
-                    ],
-                    "volume": [float(b.get("volume") or 0.0) for b in bars],
-                }
+                if want_ohlc:
+                    # _get_vnindex_bars trả dict có ít nhất close/volume; chỉ thêm
+                    # open/high/low nếu nguồn thực sự cung cấp (không bịa số liệu).
+                    vnx: Dict[str, List[float]] = {
+                        "close": [
+                            float(b["close"]) for b in bars if b.get("close") is not None
+                        ],
+                        "volume": [float(b.get("volume") or 0.0) for b in bars],
+                    }
+                    for key in ("open", "high", "low"):
+                        if bars and all(b.get(key) is not None for b in bars):
+                            vnx[key] = [float(b[key]) for b in bars]
+                    out["VNINDEX"] = vnx
+                else:
+                    out["VNINDEX"] = {
+                        "close": [
+                            float(b["close"]) for b in bars if b.get("close") is not None
+                        ],
+                        "volume": [float(b.get("volume") or 0.0) for b in bars],
+                    }
+            elif want_ohlc:
+                ohlc = _get_equity_ohlc(sym, days)
+                if ohlc is None:
+                    out[sym] = {
+                        "open": [],
+                        "high": [],
+                        "low": [],
+                        "close": [],
+                        "volume": [],
+                        "time": [],
+                    }
+                else:
+                    out[sym] = ohlc
             else:
                 closes = _get_equity_close_prices(sym, days) or []
                 out[sym] = {"close": [float(c) for c in closes], "volume": []}
