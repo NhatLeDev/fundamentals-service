@@ -177,11 +177,16 @@ _VNINDEX_CACHE_TTL_SECONDS = max(
 _VN30_BREADTH_CACHE_TTL_SECONDS = max(
     10, int(os.environ.get("VN30_BREADTH_CACHE_TTL_SECONDS", "600"))
 )
+# Dòng tiền lớn cấp index (proxy VN30): foreign/prop net theo ngày đổi 1 lần/phiên → cache dài 30'.
+_VN30_FLOW_CACHE_TTL_SECONDS = max(
+    10, int(os.environ.get("VN30_FLOW_CACHE_TTL_SECONDS", "1800"))
+)
 _cache_lock = Lock()
 _fundamentals_cache: Dict[str, Dict[str, Any]] = {}
 _moneyflow_cache: Dict[str, Dict[str, Any]] = {}
 _vnindex_cache: Dict[str, Dict[str, Any]] = {}
 _vn30_breadth_cache: Dict[str, Dict[str, Any]] = {}
+_vn30_flow_cache: Dict[str, Dict[str, Any]] = {}
 # Catalyst/ownership (news, events, shareholders, officers, insider) đổi chậm →
 # cache dài 6h/ticker. Khi rate-limited thì serve stale (include_expired=True).
 _company_catalyst_cache: Dict[str, Dict[str, Any]] = {}
@@ -2602,6 +2607,85 @@ def _build_moneyflow_response(
         "ssi_token_available": bool(token),
     }
     return out, debug
+
+
+def _compute_vn30_market_flow(
+    total_days: int = 30, trend_sessions: int = 20
+) -> Dict[str, Any]:
+    """
+    Dòng tiền lớn cấp index (proxy VN30): cộng dồn foreign/prop NET theo ngày trên rổ VN30.
+    Không có nguồn foreign toàn HOSE trực tiếp → VN30 (~70-80% vốn hoá, nơi tiền lớn tập trung)
+    là proxy đại diện nhất. Tái dùng _build_moneyflow_response (SSI FC + cache 120s/mã). Cache 30'.
+    """
+    empty: Dict[str, Any] = {
+        "marketForeignNetSeries": None,
+        "marketProprietaryNetSeries": None,
+        "marketFlowBasket": "VN30",
+        "marketFlowSampleSize": None,
+    }
+    cache_key = f"vn30_flow_{total_days}_{trend_sessions}"
+    cached = _cache_get(_vn30_flow_cache, cache_key)
+    if cached is not None:
+        return cached
+    try:
+        symbols = _vn30_symbol_list()
+        if not symbols:
+            return empty
+        per_symbol, _ = _build_moneyflow_response(symbols, total_days, trend_sessions)
+
+        f_by_date: Dict[str, float] = {}
+        p_by_date: Dict[str, float] = {}
+        used = 0
+        for _sym, payload in per_symbol.items():
+            if not payload:
+                continue
+            fseries = payload.get("foreignNetSeries") or []
+            pseries = payload.get("proprietaryNetSeries") or []
+            if fseries or pseries:
+                used += 1
+            for pt in fseries:
+                d, n = pt.get("date"), pt.get("net")
+                if d is not None and isinstance(n, (int, float)):
+                    f_by_date[d] = f_by_date.get(d, 0.0) + float(n)
+            for pt in pseries:
+                d, n = pt.get("date"), pt.get("net")
+                if d is not None and isinstance(n, (int, float)):
+                    p_by_date[d] = p_by_date.get(d, 0.0) + float(n)
+
+        f_out = [{"date": d, "net": round(v)} for d, v in sorted(f_by_date.items())]
+        p_out = [{"date": d, "net": round(v)} for d, v in sorted(p_by_date.items())]
+        result = {
+            "marketForeignNetSeries": f_out or None,
+            "marketProprietaryNetSeries": p_out or None,
+            "marketFlowBasket": "VN30",
+            "marketFlowSampleSize": used,
+        }
+        # Chỉ cache khi có dữ liệu thật (tránh khoá rỗng 30' khi SSI/vnstock đang chập).
+        if f_out or p_out:
+            _cache_set(_vn30_flow_cache, cache_key, result, _VN30_FLOW_CACHE_TTL_SECONDS)
+        return result
+    except Exception:
+        return empty
+
+
+@app.get("/api/vnindex-flow")
+@app.get("/vnindex-flow")
+def api_vnindex_flow():
+    """
+    GET dòng tiền lớn cấp index (proxy VN30): chuỗi foreign/prop NET theo ngày (cộng dồn rổ VN30).
+    Tách khỏi /vnindex-overview để KHÔNG làm chậm/treo path overview (VN30 moneyflow cold-cache nặng).
+    """
+    try:
+        return JSONResponse(content=_compute_vn30_market_flow())
+    except Exception:
+        return JSONResponse(
+            content={
+                "marketForeignNetSeries": None,
+                "marketProprietaryNetSeries": None,
+                "marketFlowBasket": "VN30",
+                "marketFlowSampleSize": None,
+            }
+        )
 
 
 @app.post("/api/moneyflow")
