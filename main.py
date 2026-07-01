@@ -876,8 +876,10 @@ def _yahoo_try_symbol_vnindex_bars(
         q0 = quote_block[0] if quote_block else {}
         closes_raw = q0.get("close") or []
         vols_raw = q0.get("volume") or []
+        times_raw = results[0].get("timestamp") or []
         if not closes_raw:
             return None
+        import datetime as _dt
         bars_y: List[Dict[str, float]] = []
         for i, c in enumerate(closes_raw):
             if c is None or not isinstance(c, (int, float)):
@@ -887,7 +889,13 @@ def _yahoo_try_symbol_vnindex_bars(
                 if i < len(vols_raw) and isinstance(vols_raw[i], (int, float))
                 else 0.0
             )
-            bars_y.append({"close": float(c), "volume": vv})
+            bar: Dict[str, Any] = {"close": float(c), "volume": vv}
+            if i < len(times_raw) and isinstance(times_raw[i], (int, float)):
+                try:
+                    bar["date"] = _dt.datetime.utcfromtimestamp(int(times_raw[i])).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+            bars_y.append(bar)
         if len(bars_y) < 20:
             return None
         return bars_y[-days:] if len(bars_y) > days else bars_y
@@ -1176,7 +1184,18 @@ def _get_vnindex_bars(days: int = 260) -> Optional[List[Dict[str, float]]]:
             vols = _safe_float_list(vol_series)
             if len(vols) != len(closes):
                 vols = [0.0] * len(closes)
-        out = [{"close": closes[i], "volume": vols[i]} for i in range(len(closes))]
+        # Cột ngày (nếu có) → giữ để client liệt kê ngày phiên phân phối.
+        dates: List[Optional[str]] = [None] * len(closes)
+        for col_name in ("time", "Time", "date", "Date", "tradingDate", "trading_date"):
+            if hasattr(df, "columns") and col_name in df.columns:
+                ds = [_catalyst_date_str(v) for v in list(df[col_name])]
+                if len(ds) == len(closes):
+                    dates = ds
+                break
+        out = [
+            {"close": closes[i], "volume": vols[i], "date": dates[i]}
+            for i in range(len(closes))
+        ]
         return out[-days:] if len(out) > days else out
 
     def _on_vnstock_quota_exit() -> None:
@@ -1852,25 +1871,27 @@ def api_history(req: HistoryRequest):
         try:
             if sym in ("VNINDEX", "^VNINDEX", "VN-INDEX", "VNI"):
                 bars = _get_vnindex_bars(days) or []
+                # date[] căn theo bar có close hợp lệ (align với close/volume). Nguồn nào không có
+                # ngày → phần tử null; client chỉ dùng khi mảng đủ & khớp độ dài (degrade an toàn).
+                valid_bars = [b for b in bars if b.get("close") is not None]
+                date_arr = [b.get("date") for b in valid_bars]
                 if want_ohlc:
                     # _get_vnindex_bars trả dict có ít nhất close/volume; chỉ thêm
                     # open/high/low nếu nguồn thực sự cung cấp (không bịa số liệu).
-                    vnx: Dict[str, List[float]] = {
-                        "close": [
-                            float(b["close"]) for b in bars if b.get("close") is not None
-                        ],
-                        "volume": [float(b.get("volume") or 0.0) for b in bars],
+                    vnx: Dict[str, List[Any]] = {
+                        "close": [float(b["close"]) for b in valid_bars],
+                        "volume": [float(b.get("volume") or 0.0) for b in valid_bars],
+                        "date": date_arr,
                     }
                     for key in ("open", "high", "low"):
                         if bars and all(b.get(key) is not None for b in bars):
-                            vnx[key] = [float(b[key]) for b in bars]
+                            vnx[key] = [float(b[key]) for b in valid_bars]
                     out["VNINDEX"] = vnx
                 else:
                     out["VNINDEX"] = {
-                        "close": [
-                            float(b["close"]) for b in bars if b.get("close") is not None
-                        ],
-                        "volume": [float(b.get("volume") or 0.0) for b in bars],
+                        "close": [float(b["close"]) for b in valid_bars],
+                        "volume": [float(b.get("volume") or 0.0) for b in valid_bars],
+                        "date": date_arr,
                     }
             elif want_ohlc:
                 ohlc = _get_equity_ohlc(sym, days)
@@ -2421,7 +2442,8 @@ def _ssi_vnindex_bars_from_fastconnect(days: int) -> Optional[List[Dict[str, flo
     rows.sort(key=lambda x: x[0])
     if len(rows) < 20:
         return None
-    bars = [{"close": r[1], "volume": r[2]} for r in rows]
+    # Giữ NGÀY (r[0]) để /api/history trả về date[] → client liệt kê được phiên phân phối.
+    bars = [{"close": r[1], "volume": r[2], "date": _format_iso_date(r[0])} for r in rows]
     return bars[-days:] if len(bars) > days else bars
 
 
