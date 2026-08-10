@@ -437,6 +437,29 @@ def _parse_ratio_df(df) -> Dict[str, Optional[float]]:
     return out
 
 
+def _parse_eps_history(df) -> Optional[List[float]]:
+    """EPS qua NHIỀU kỳ (năm) từ ratio df — để app chuẩn hoá earnings (TB nhiều năm), chặn bẫy
+    'P/E thấp vì lãi đỉnh chu kỳ'. Trả list EPS (mới → cũ), None nếu <2 kỳ. KHÔNG cần call vnstock
+    thêm: tái dùng df ratio đã fetch. KBS year thường cho ~4 kỳ → đủ để lấy trung bình."""
+    meta = {"item", "item_id", "item_en", "unit", "levels", "row_number"}
+    period_cols = [c for c in df.columns if c not in meta and str(c).strip()]
+    if not period_cols:
+        return None
+    for _, row in df.iterrows():
+        raw = (row.get("item_id") or row.get("item_en") or row.get("item")) or ""
+        item_id = str(raw).strip().lower().replace(" ", "_").replace("-", "_")
+        if _ITEM_ID_TO_FIELD.get(item_id) != "eps":
+            continue
+        vals: List[float] = []
+        for c in period_cols:
+            v = _safe_float(row.get(c))
+            if v is not None:
+                vals.append(v)
+        if len(vals) >= 2:
+            return vals[:5]
+    return None
+
+
 def _get_trading_flow(symbol: str, days: int = 30) -> Optional[Dict[str, Any]]:
     """
     Lấy dòng tiền khối ngoại và tự doanh (nếu có vnstock_data).
@@ -729,9 +752,11 @@ def _extract(symbol: str, source: str) -> Dict[str, Any]:
     cash_flow_operating = cash_flow_net = None
     volume_ma20 = volume_ma50 = None
     df = _get_ratio_df(symbol, source)
+    eps_history = None
     if df is not None:
         out = _parse_ratio_df(df)
         pe, pb, roe, eps = out["pe"], out["pb"], out["roe"], out["eps"]
+        eps_history = _parse_eps_history(df)
     if (pe is None or pb is None) and df is None:
         overview_row = _get_overview_row(symbol, source)
         if overview_row:
@@ -755,6 +780,8 @@ def _extract(symbol: str, source: str) -> Dict[str, Any]:
         "roe": roe,
         "eps": eps,
     }
+    if eps_history:
+        result["eps_history"] = eps_history
     if cash_flow_operating is not None or cash_flow_net is not None:
         result["cash_flow_operating"] = cash_flow_operating
         result["cash_flow_net"] = cash_flow_net
