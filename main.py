@@ -143,6 +143,21 @@ SOURCES = [
 if not SOURCES:
     SOURCES = ["KBS", "VCI"]
 
+# Cùng bài học trên, nhưng cho `Quote` (giá) — trước đây MỚI chỉ áp cho `Finance`.
+#
+# [ĐO] 04/09/2026 trên vnstock 4.0.7, gọi trực tiếp `Quote(symbol="HCM", source=...)`:
+#   KBS  → OK, 249 nến, nến cuối 2026-09-04
+#   VCI  → OK, 263 nến, nến cuối 2026-09-04
+#   TCBS → ValueError ngay trong __init__ ("chỉ nhận kbs, vci, msn, dnse, binance, fmp…")
+#   DNSE → ValueError: Provider 'quote/dnse' not found. Available: ['fmp','kbs','msn','vci']
+#          (thử cả "dnse" lẫn "DNSE" — không phải lỗi hoa/thường, registry đơn giản là không có)
+# ⇒ chuỗi ("KBS","TCBS","DNSE","VCI") viết ở nhiều chỗ THỰC CHẤT chỉ là KBS → VCI, và chuỗi
+#   VNINDEX ("KBS","TCBS","DNSE") suy biến còn ĐÚNG MỘT nguồn — mất hẳn fallback mà không ai biết.
+#
+# ⚠️ Danh sách này phụ thuộc BẢN vnstock đang cài. `requirements.txt` đã ghim để nó không đổi
+# âm thầm sau mỗi lần build lại.
+_VALID_QUOTE_SOURCES = ("KBS", "VCI")
+
 # Mặc định tắt field "nặng" để giảm số request/ticker khi dùng Guest plan.
 # Có thể bật lại bằng FUNDAMENTALS_ENABLE_HEAVY_FIELDS=1.
 _ENABLE_HEAVY_FIELDS = (
@@ -826,7 +841,8 @@ def _get_symbol_volume_ma(symbol: str, preferred_source: str, days: int = 120) -
     if Quote is None:
         return None
 
-    src_candidates = [preferred_source, "KBS", "TCBS", "DNSE", "VCI"]
+    # TCBS/DNSE không phải nguồn `Quote` hợp lệ — xem `_VALID_QUOTE_SOURCES`.
+    src_candidates = [preferred_source, *_VALID_QUOTE_SOURCES]
     tried: List[str] = []
     sources = []
     for s in src_candidates:
@@ -1033,7 +1049,8 @@ def _vnindex_bars_try_vnstock_paths(
         return None, False
 
     if Quote is not None:
-        for source in ("KBS", "TCBS", "DNSE"):
+        # Trước đây thiếu VCI ⇒ trên vnstock 4.0.7 chuỗi này suy biến còn ĐÚNG MỘT nguồn (KBS).
+        for source in _VALID_QUOTE_SOURCES:
             if not _vnstock_limiter.wait_if_needed(max_wait=3.0):
                 break
             try:
@@ -1510,7 +1527,7 @@ def _vn30_symbol_list() -> List[str]:
 def _get_equity_close_prices(symbol: str, days: int = 220) -> Optional[List[float]]:
     if Quote is None:
         return None
-    for source in ("KBS", "TCBS", "DNSE", "VCI"):
+    for source in _VALID_QUOTE_SOURCES:
         try:
             quote = Quote(symbol=symbol, source=source)
             df = quote.history(length="1Y", interval="1D")
@@ -1527,16 +1544,114 @@ def _get_equity_close_prices(symbol: str, days: int = 220) -> Optional[List[floa
     return None
 
 
+def _vn_today() -> str:
+    """Ngày hôm nay theo giờ VN (UTC+7), "YYYY-MM-DD". Không phụ thuộc TZ của máy chủ."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    return (_dt.now(_tz.utc) + _td(hours=7)).strftime("%Y-%m-%d")
+
+
+# Ngày phiên QUAN SÁT ĐƯỢC từ chính các chuỗi giá vừa trả: ngày -> tập mã đã thấy ngày đó.
+# Mã nào có nến ngày D thì D CHẮC CHẮN là phiên sàn mở — không cần hỏi thêm nguồn nào.
+_observed_session_dates: Dict[str, set] = {}
+_OBSERVED_KEEP_DATES = 40  # chỉ cần vài phiên gần nhất; giữ nhỏ để không phình bộ nhớ
+
+
+def _record_observed_session_date(symbol: str, date_str: Optional[str]) -> None:
+    """Ghi nhận "mã X có nến ngày D". Bỏ ngày ở TƯƠNG LAI (nến lỗi không được kéo mốc đi)."""
+    if not date_str or len(date_str) < 10:
+        return
+    d = date_str[:10]
+    if d > _vn_today():
+        return
+    with _cache_lock:
+        _observed_session_dates.setdefault(d, set()).add(symbol)
+        if len(_observed_session_dates) > _OBSERVED_KEEP_DATES:
+            for old in sorted(_observed_session_dates)[:-_OBSERVED_KEEP_DATES]:
+                _observed_session_dates.pop(old, None)
+
+
+def _latest_known_session_date() -> Optional[str]:
+    """Ngày phiên mới nhất mà service ĐÃ BIẾT. `None` = chưa biết → caller bỏ qua kiểm tra.
+
+    Hai nguồn, lấy ngày MUỘN hơn:
+      1. cache VN-Index — chỉ ĐỌC (`_cache_peek_fresh`), TUYỆT ĐỐI không gọi `_get_vnindex_bars`:
+         hàm đó có thể kích hoạt fetch vnstock, mà trần dùng chung chỉ 30 call/phút trong khi một
+         lần chạy báo cáo phía client đã cần ~88 call. Biến phép kiểm tra thành nguồn tải mới là
+         đổi bug lấy bug.
+      2. **lát cắt ngang tự ấm** — ngày quan sát được từ chính các chuỗi vừa trả cho request trước.
+
+    Vì sao cần (2): [ĐO] 04/09/2026, `GET /api/vnindex-overview` trên prod trả **HTTP 500 sau 70s**
+    (đúng triệu chứng đã ghi từ 12/08), còn `/api/history` chỉ chạm VN-Index khi client hỏi đúng
+    symbol VNINDEX — vốn hiếm vì client lấy index từ DNSE. Nếu chỉ dựa (1) thì cache gần như luôn
+    nguội và phép kiểm tra độ tươi NẰM IM, tức bản vá chỉ tồn tại trên giấy.
+
+    Chốt an toàn: một ngày phải có **≥2 mã** cùng thấy mới được làm mốc. Mốc này chạy ngược — mốc
+    càng mới thì càng nhiều mã bị coi là trễ — nên một chuỗi hỏng đơn lẻ không được phép kéo nó lên.
+    """
+    best: Optional[str] = None
+    with _cache_lock:
+        keys = [k for k in _vnindex_cache if k.startswith("vnindex_bars_")]
+    for key in keys:
+        bars = _cache_peek_fresh(_vnindex_cache, key)
+        if not bars:
+            continue
+        for bar in bars:
+            d = bar.get("date") if isinstance(bar, dict) else None
+            if isinstance(d, str) and len(d) >= 10:
+                d = d[:10]
+                if best is None or d > best:
+                    best = d
+
+    with _cache_lock:
+        corroborated = [d for d, syms in _observed_session_dates.items() if len(syms) >= 2]
+    if corroborated:
+        cross = max(corroborated)
+        if best is None or cross > best:
+            best = cross
+    return best
+
+
+def _ohlc_last_date(ohlc: Dict[str, List[Any]]) -> Optional[str]:
+    """Ngày của nến CUỐI trong payload `_get_equity_ohlc`. None nếu nguồn không trả cột time."""
+    times = ohlc.get("time") or []
+    for value in reversed(times):
+        if isinstance(value, str) and len(value) >= 10:
+            return value[:10]
+    return None
+
+
 def _get_equity_ohlc(symbol: str, days: int = 260) -> Optional[Dict[str, List[Any]]]:
     """Chuỗi nến daily đầy đủ (open/high/low/close/volume/time) cho 1 mã lẻ, cũ → mới.
 
-    Mirror `_get_equity_close_prices`: cùng thứ tự nguồn (KBS → TCBS → DNSE → VCI),
-    cùng try/except theo từng nguồn, nhưng trả về full OHLCV + time ("YYYY-MM-DD").
-    Bọc call qua `_rl_call` để dùng chung rate limiter của service.
+    Mirror `_get_equity_close_prices`: cùng thứ tự nguồn, cùng try/except theo từng nguồn,
+    nhưng trả về full OHLCV + time ("YYYY-MM-DD"). Bọc call qua `_rl_call` để dùng chung rate
+    limiter của service.
+
+    ─── CHỌN NGUỒN THEO ĐỘ TƯƠI, KHÔNG CHỈ THEO ĐỘ DÀI ────────────────────────────────────────
+    Trước đây điều kiện nhận duy nhất là "≥200 nến" — không dòng nào nhìn ngày của nến cuối. Nguồn
+    đầu trễ một phiên là trả luôn, không bao giờ thử nguồn sau.
+
+    [ĐO] hậu quả thật, census 39 row cache `ohlc:v2:` phía client (04/09/2026): BAF và VCB được ghi
+    lúc 03/09 10:27 với n=248 (dáng KBS) và nến cuối **28/08**, trong khi DGW và VNM ghi CÙNG PHÚT
+    ĐÓ, cùng đường này, lại có nến **03/09**. Cùng service, cùng phút, độ tươi khác nhau theo mã.
+    Phía client, một nến sai làm cổng canh mua đọc nhầm cây nến của red-line → phán quyết sai cả
+    hai chiều (HCM/VND bị cấm oan, VIB đáng cấm lại thoát).
+
+    Chi phí: ca thường **0 call thêm** — nguồn đầu tươi là nhận ngay. Chỉ khi nguồn đầu trễ mới thử
+    tiếp, và nhiều nhất là hết `_VALID_QUOTE_SOURCES` (2 nguồn), không phải 4.
+
+    Fail-open có chủ đích: không biết mốc phiên (`_latest_known_session_date()` = None, tức chưa có
+    cache VN-Index) → nhận nguồn đầu như cũ. Mọi nguồn đều trễ → vẫn trả bản tươi NHẤT thay vì trả
+    None; "dữ liệu hơi cũ" tốt hơn "không có dữ liệu", và phía client đã có cổng UNMEASURED chặn
+    việc phán quyết trên chuỗi cũ.
     """
     if Quote is None:
         return None
-    for source in ("KBS", "TCBS", "DNSE", "VCI"):
+    latest_known = _latest_known_session_date()
+    best: Optional[Dict[str, List[Any]]] = None
+    best_date: Optional[str] = None
+    for source in _VALID_QUOTE_SOURCES:
         try:
             quote = Quote(symbol=symbol, source=source)
             df = _rl_call(
@@ -1575,7 +1690,7 @@ def _get_equity_ohlc(symbol: str, days: int = 260) -> Optional[Dict[str, List[An
             def _tail(seq: List[Any]) -> List[Any]:
                 return seq[-days:] if len(seq) > days else seq
 
-            return {
+            candidate: Dict[str, List[Any]] = {
                 "open": _tail(opens),
                 "high": _tail(highs),
                 "low": _tail(lows),
@@ -1583,9 +1698,31 @@ def _get_equity_ohlc(symbol: str, days: int = 260) -> Optional[Dict[str, List[An
                 "volume": _tail(vols),
                 "time": _tail(times),
             }
+            cand_date = _ohlc_last_date(candidate)
+            # Tự làm ấm mốc: chuỗi này có nến ngày đó ⇒ ngày đó là phiên sàn mở. Ghi TRƯỚC khi so,
+            # nhưng mốc dùng để so là `latest_known` chụp từ đầu hàm ⇒ mã không tự chấm điểm mình.
+            _record_observed_session_date(symbol, cand_date)
+
+            # Đủ tươi (hoặc không có mốc để so / nguồn không trả ngày) → nhận ngay, không gọi thêm.
+            if latest_known is None or cand_date is None or cand_date >= latest_known:
+                return candidate
+
+            print(
+                f"[history] {symbol}: nguồn {source} trễ (nến cuối {cand_date} < phiên đã biết "
+                f"{latest_known}) → thử nguồn kế",
+                flush=True,
+            )
+            if best_date is None or cand_date > best_date:
+                best, best_date = candidate, cand_date
         except Exception:
             continue
-    return None
+    # Mọi nguồn đều trễ → trả bản TƯƠI NHẤT (fail-open), không trả None.
+    if best is not None:
+        print(
+            f"[history] {symbol}: MỌI nguồn đều trễ, dùng bản mới nhất (nến cuối {best_date})",
+            flush=True,
+        )
+    return best
 
 
 def _vn30_one_above_ma200(sym: str) -> Optional[bool]:

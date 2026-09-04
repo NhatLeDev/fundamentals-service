@@ -1,6 +1,10 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
-vnstock>=3.4.0
+# GHIM, không dùng >=: danh sách nguồn hợp lệ của `Quote`/`Finance` đổi theo bản vnstock.
+# [ĐO] 04/09/2026 trên 4.0.7 — `Quote` chỉ còn KBS + VCI; TCBS và DNSE đều ném ValueError.
+# Một lần build lại kéo bản mới có thể làm rơi nguồn mà không có tín hiệu nào. Nâng bản phải đi
+# kèm chạy lại phép đo đó (xem `_VALID_QUOTE_SOURCES` trong main.py).
+vnstock==4.0.7
 pandas>=2.0.0
 pytz>=2024.1
 git+https://github.com/vuthanhdatt/vnstock-data-python.git
