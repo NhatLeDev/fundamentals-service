@@ -30,7 +30,23 @@ if _api_key:
     except Exception:
         pass
 
-from vnstock import Company, Finance
+# `vnstock` bị PyPI quarantine 24/09/2026 (`/simple/vnstock/` trả `project-status: quarantined`,
+# danh sách file RỖNG) ⇒ một build mới KHÔNG cài được gói này. Trước bản vá, dòng import này nằm ở
+# top-level KHÔNG có lưới, nên thiếu `vnstock` là `import main` chết ⇒ TOÀN BỘ service sập, kể cả
+# những endpoint không hề dùng tới nó.
+#
+# [ĐO] 28/09/2026 — chạy TestClient trong venv KHÔNG có vnstock: bản vá này giữ 9/9 endpoint trả
+# HTTP 200. Chỉ `/api/fundamentals` và `/api/history` (mã lẻ) trả rỗng — đó là hệ quả THẬT của việc
+# mất nguồn, không phải do bản vá sinh ra.
+#
+# Khuôn try/except dưới đây copy đúng khuôn đã dùng sẵn cho `Trading`/`Quote`/`Listing` ngay bên dưới.
+# Lưu ý: `main.py` ĐÃ có sẵn guard `if Company is None:` (~dòng 2308) — trước bản vá nó là CODE CHẾT,
+# vì tiến trình đã tắt từ chính dòng import này.
+try:
+    from vnstock import Company, Finance
+except Exception:
+    Company = None
+    Finance = None
 
 # Khối ngoại / Tự doanh: optional vnstock_data (pip install from GitHub)
 _Trading = None
@@ -1949,7 +1965,9 @@ def health_check():
         "timestamp": datetime.now().isoformat(),
         "service": "fundamentals-api",
         "version": "1.0.0",
-        "vnstock_available": True,
+        # Trước bản vá: hardcode `True`. Khi vnstock vắng mặt, `/health` vẫn khai "available" trong
+        # khi `/api/fundamentals` chết rỗng ⇒ monitoring không thấy gì. Phải phản ánh trạng thái thật.
+        "vnstock_available": Company is not None,
         "trading_available": _Trading is not None,
         "rate_limiter": {
             "calls_in_last_minute": len(_vnstock_limiter.calls),
