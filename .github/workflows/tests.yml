@@ -1,0 +1,49 @@
+name: Tests
+
+# VÌ SAO CÓ FILE NÀY: trước 12/10/2026 repo này KHÔNG có job test nào, và `pytest` cũng không nằm
+# trong `requirements.txt` — nên `test_history_freshness.py` và `test_moneyflow_proprietary.py`
+# **không bao giờ đỏ được**. Một test không chạy là chú thích, không phải chốt chặn.
+#
+# Cái đang được bảo vệ ở đây không phải "code chạy đúng" mà là "backend không bịa số tự doanh":
+# `main.py` từng tính tự doanh = tổng − khối ngoại (sai định nghĩa) và lấp None thành 0; cả hai đều
+# lọt qua cờ `proprietaryAvailable` của stock-analysis rồi được in vào prompt NHƯ SỰ THẬT.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test deps
+        # CỐ Ý chỉ cài `requirements-dev.txt`, KHÔNG cài `requirements.txt`: file prod ghim
+        # `vnstock==4.0.7` đang bị PyPI quarantine ⇒ cài vào là job fail trước khi chạy được test
+        # nào. `main.py` đã chịu được vnstock vắng mặt (commit 991f19c) nên import vẫn qua.
+        run: pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        # VNSTOCK_API_KEY phải RỖNG: có key thì `main.py:25-29` gọi `register_user`, kéo theo import
+        # `vnstock` → gói `vnai` ghi file ra $HOME của runner. Không cần cho test, và là side effect.
+        env:
+          VNSTOCK_API_KEY: ""
+          VNSTOCK_DISABLE_AGENT_SETUP: "1"
+        run: python -m pytest -q
+
+      - name: Assert vnstock/vnai did NOT get installed
+        # Lưới an toàn: nếu ai đó thêm vnstock vào requirements-dev.txt thì kêu ngay, đừng để nó
+        # lặng lẽ chạy trong CI.
+        run: |
+          if pip list 2>/dev/null | grep -Ei '^(vnstock|vnai)\b'; then
+            echo "::error::vnstock/vnai bị cài vào môi trường test — xem ghi chú đầu requirements-dev.txt"
+            exit 1
+          fi
+          echo "OK: không có vnstock/vnai"

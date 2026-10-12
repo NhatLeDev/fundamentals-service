@@ -1,0 +1,15 @@
+# Phụ thuộc CHỈ để chạy test. KHÔNG cài file này lên Render — `requirements.txt` mới là của prod.
+#
+# VÌ SAO TÁCH RA, VÀ VÌ SAO KHÔNG `-r requirements.txt`:
+# `requirements.txt` ghim `vnstock==4.0.7` + một gói cài từ GitHub. PyPI quarantine `vnstock`/`vnai`
+# từ 24/09/2026 ⇒ `pip install -r requirements.txt` FAIL, nên nếu CI phụ thuộc vào nó thì test sẽ
+# không bao giờ chạy được. `main.py` đã chịu được vnstock vắng mặt (commit 991f19c), nên test chỉ
+# cần đúng mấy gói import ở top-level.
+#
+# ⚠️ TUYỆT ĐỐI không thêm `vnstock`/`vnai` vào đây: gói `vnai` tự ghi đè `~/.claude/CLAUDE.md` và
+# sinh `AGENTS.md` mỗi lần import — side effect đó THOÁT KHỎI venv vì nó ghi vào $HOME.
+fastapi>=0.115.0
+pydantic>=2
+pandas>=2.0.0
+pytz>=2024.1
+pytest>=8.0
