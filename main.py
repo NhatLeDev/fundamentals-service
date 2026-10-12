@@ -720,9 +720,38 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
             except Exception:
                 continue
             part = _extract_moneyflow_from_trading(trading, start_str, end_str)
-            for k, v in part.items():
-                if v is not None and (merged.get(k) is None):
+
+            # CẶP mua/bán phải lấy NGUYÊN KHỐI TỪ MỘT NGUỒN — không ghép vế mua của nguồn này với
+            # vế bán của nguồn kia.
+            #
+            # Bản cũ trộn theo TỪNG TRƯỜNG (`if v is not None and merged[k] is None`). Hai hỏng:
+            #   (a) một `0.0` từ nguồn đầu KHOÁ vĩnh viễn vế đó, nguồn sau có số thật không ghi đè
+            #       được — `_moneyflow_dict_has_values` dùng `abs(v) > 1e-9` nên vòng lặp vẫn chạy
+            #       tiếp nhưng vô ích;
+            #   (b) kết quả là cặp lai: `{proprietaryBuy: 0 (vci), proprietarySell: 5e8 (tcbs)}`.
+            #       Hiệu của hai vế khác nguồn KHÔNG có nghĩa, mà `proprietaryBuy` lại là số hữu
+            #       hạn ⇒ `market-api.ts:3948-3950` bật `proprietaryAvailable` ⇒ `gemini.ts:1857`
+            #       in "Tự doanh: Mua 0 · Bán 500.000.000 · Ròng -500.000.000" NHƯ SỰ THẬT.
+            #
+            # Nhận một cặp khi nguồn này có ÍT NHẤT MỘT vế mang số khác 0 — toàn 0/None thì không
+            # phân biệt được "thật sự không giao dịch" với "không lấy được", nên bỏ qua, để nguồn
+            # sau có cơ hội. Nhận rồi thì KHOÁ cặp (nguồn sau không ghi đè) để giữ tính nhất quán.
+            for buy_key, sell_key in (
+                ("foreignBuy", "foreignSell"),
+                ("proprietaryBuy", "proprietarySell"),
+            ):
+                if merged.get(buy_key) is not None or merged.get(sell_key) is not None:
+                    continue  # cặp đã lấy trọn từ nguồn trước
+                b, s = part.get(buy_key), part.get(sell_key)
+                if (b not in (None, 0)) or (s not in (None, 0)):
+                    merged[buy_key], merged[sell_key] = b, s
+
+            # Mấy trường room/ownership là số ĐƠN LẺ, không thành cặp ⇒ trộn theo trường như cũ.
+            for k in ("foreignRoomCurrent", "foreignRoomTotal", "foreignOwnership"):
+                v = part.get(k)
+                if v is not None and merged.get(k) is None:
                     merged[k] = v
+
             if _moneyflow_dict_has_values(merged):
                 break
 
@@ -734,14 +763,40 @@ def _get_moneyflow(symbol: str, days: int = 30) -> Optional[Dict[str, Optional[f
 def _vnstock_moneyflow_to_api_shape(
     vn: Dict[str, Optional[float]], total_days: int
 ) -> Optional[Dict[str, Any]]:
-    """Chuyển dict phẳng từ _get_moneyflow sang payload giống SSI (không có series)."""
+    """Chuyển dict phẳng từ _get_moneyflow sang payload giống SSI (không có series).
+
+    `or 0` làm MẤT phân biệt "nguồn không trả" với "nguồn trả 0": cả hai thành 0, mà 0 là số
+    hữu hạn nên cờ `proprietaryAvailable` phía consumer BẬT (market-api.ts:3948-3950) và
+    gemini.ts:1857 in "Tự doanh: Mua 0 · Bán 0" như sự thật — đúng cái kết luận sai về THỊ TRƯỜNG
+    mà gemini.ts:1853-1855 đã ghi chú là phải tránh. Giữ None xuyên suốt để cờ đó tắt.
+    """
     if not vn:
         return None
-    fb = int(round(float(vn.get("foreignBuy") or 0)))
-    fs = int(round(float(vn.get("foreignSell") or 0)))
-    pb = int(round(float(vn.get("proprietaryBuy") or 0)))
-    ps = int(round(float(vn.get("proprietarySell") or 0)))
-    if fb == 0 and fs == 0 and pb == 0 and ps == 0:
+
+    def _num(key: str) -> Optional[int]:
+        v = vn.get(key)
+        # bool PHẢI loại trước: `isinstance(True, int)` là True trong Python ⇒ True sẽ thành 1.
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:  # bool/None/NaN/kiểu lạ
+            return None
+        return int(round(float(v)))
+
+    fb, fs = _num("foreignBuy"), _num("foreignSell")
+    pb, ps = _num("proprietaryBuy"), _num("proprietarySell")
+
+    # TỰ DOANH 0/0 ⇒ ÉP VỀ None. Lọc này là chốt chặn thứ hai và nó CẦN THIẾT: chốt "tất cả đều
+    # None-hoặc-0" bên dưới KHÔNG bắt được ca khối ngoại có số thật + tự doanh = 0, nên payload
+    # vẫn đi tiếp kèm `proprietaryBuy: 0` — 0 là số hữu hạn ⇒ `proprietaryAvailable` BẬT ⇒
+    # gemini.ts:1857 in "Tự doanh: Mua 0 · Bán 0" như sự thật. Đúng lỗi mà hàm này sinh ra để diệt.
+    #
+    # ĐÁNH ĐỔI, nói thẳng: nếu một phiên tự doanh THẬT SỰ không giao dịch thì 0/0 là sự thật và ở
+    # đây ta vứt nó đi. Chấp nhận, vì nguồn hiện tại KHÔNG phân biệt được "thật sự 0" với "không
+    # lấy được" — `_get_moneyflow` (main.py:688-727) nhận 0.0 từ nguồn đầu rồi khoá luôn vế đó.
+    # Mất một sự thật ít giá trị còn hơn in một mệnh đề sai về thị trường vào prompt ra khuyến nghị.
+    if pb in (None, 0) and ps in (None, 0):
+        pb = ps = None
+
+    # Không còn vế nào mang số thật khác 0 ⇒ coi như nguồn không trả gì.
+    if not any(v not in (None, 0) for v in (fb, fs, pb, ps)):
         return None
     return {
         "foreignBuy": fb,
@@ -2671,29 +2726,30 @@ def _compute_money_flow_for_symbol(
 
         foreign_buy = _parse_sci_float(it.get("ForeignBuyValTotal"))
         foreign_sell = _parse_sci_float(it.get("ForeignSellValTotal"))
-        total_buy = _parse_sci_float(it.get("TotalBuyTrade"))
-        total_sell = _parse_sci_float(it.get("TotalSellTrade"))
         if foreign_buy is None or foreign_sell is None:
             continue
 
-        # Tự doanh (proprietary) = tổng giao dịch (total) - phần của khối ngoại.
-        if total_buy is None:
-            total_buy = foreign_buy
-        if total_sell is None:
-            total_sell = foreign_sell
-
-        proprietary_buy = max(0.0, total_buy - foreign_buy)
-        proprietary_sell = max(0.0, total_sell - foreign_sell)
-
+        # TỰ DOANH: endpoint này của SSI FastConnect KHÔNG có trường tự doanh — không suy ra được.
+        #
+        # Bản cũ tính `proprietary_buy = max(0, TotalBuyTrade - ForeignBuyValTotal)` và gọi đó là
+        # tự doanh. SAI về ĐỊNH NGHĨA, và chỉ cần lý lẽ này là đủ để bỏ: hiệu đó là TOÀN BỘ phần
+        # không phải khối ngoại — cá nhân trong nước + tổ chức trong nước + tự doanh CTCK GỘP LẠI —
+        # chứ không phải riêng tự doanh. (Tỷ lệ cụ thể của từng khối trong KL thị trường VN:
+        # [GIẢ ĐỊNH], repo này chưa đo; không cần tới nó để kết luận.)
+        # Hai vế còn khả nghi về thứ nguyên: `...ValTotal` là GIÁ TRỊ, `TotalBuyTrade` theo tên là
+        # SỐ LỆNH — [GIẢ ĐỊNH] từ cách đặt tên, chưa kiểm được vì không có credential SSI.
+        #
+        # Vì sao phải trả None chứ không phải 0: consumer đọc cờ `proprietaryAvailable` ở
+        # stock-analysis/app/lib/market-api.ts:3948-3950 (`pbRaw || psRaw`, bật khi là số hữu hạn
+        # — 0 CŨNG là số hữu hạn), rồi gemini.ts:1857 in "Tự doanh: Mua X · Bán Y" NHƯ SỰ THẬT.
+        # Trả None ⇒ cờ tắt ⇒ prompt in "KHÔNG CÓ DỮ LIỆU — đây là THIẾU NGUỒN" (gemini.ts:1865),
+        # đúng hiện trạng. Thà THIẾU còn hơn SAI.
         parsed.append(
             {
                 "date": _format_iso_date(d),
                 "foreignBuy": foreign_buy,
                 "foreignSell": foreign_sell,
-                "proprietaryBuy": proprietary_buy,
-                "proprietarySell": proprietary_sell,
                 "foreignNet": foreign_buy - foreign_sell,
-                "proprietaryNet": proprietary_buy - proprietary_sell,
                 "d": d,
             }
         )
@@ -2715,30 +2771,26 @@ def _compute_money_flow_for_symbol(
         }
         for p in trend_tail
     ]
-    trend_prop = [
-        {
-            "date": p["date"],
-            "buy": round(p["proprietaryBuy"]),
-            "sell": round(p["proprietarySell"]),
-            "net": round(p["proprietaryNet"]),
-        }
-        for p in trend_tail
-    ]
-
-    # Totals: sum foreign/proprietary in last `total_days` calendar window.
+    # Totals: cộng khối ngoại trong cửa sổ `total_days` ngày gần nhất.
+    #
+    # `sum([])` trả 0, KHÔNG phải None — nên cửa sổ RỖNG sẽ đẻ ra `foreignBuy: 0, foreignSell: 0`
+    # trông y như "khối ngoại không giao dịch". Ca có thật: mã ngừng giao dịch lâu hơn `total_days`
+    # (JS gửi 30, xem market-api.ts:4256) nhưng vẫn còn phiên trong cửa sổ trend (max(60, trend×2)
+    # ngày) ⇒ `parsed` KHÔNG rỗng nên hàm không trả None, mà trả 0 bịa kèm `foreignNetSeries` thật.
+    # Khác vế tự doanh, vế khối ngoại KHÔNG có cờ availability nào chặn ⇒ gemini.ts:1845 in
+    # "Khối ngoại: Mua 0 · Bán 0 · Ròng +0" VÔ ĐIỀU KIỆN. Cùng lớp lỗi `or 0` vừa diệt ở vế kia.
     totals = [p for p in parsed if p["d"] >= start_total]
-    foreignBuy = round(sum(p["foreignBuy"] for p in totals))
-    foreignSell = round(sum(p["foreignSell"] for p in totals))
-    proprietaryBuy = round(sum(p["proprietaryBuy"] for p in totals))
-    proprietarySell = round(sum(p["proprietarySell"] for p in totals))
+    foreignBuy = round(sum(p["foreignBuy"] for p in totals)) if totals else None
+    foreignSell = round(sum(p["foreignSell"] for p in totals)) if totals else None
 
     return {
         "foreignBuy": foreignBuy,
         "foreignSell": foreignSell,
-        "proprietaryBuy": proprietaryBuy,
-        "proprietarySell": proprietarySell,
+        # None (KHÔNG phải 0) — xem ghi chú "TỰ DOANH" ở vòng lặp parse phía trên.
+        "proprietaryBuy": None,
+        "proprietarySell": None,
         "foreignNetSeries": trend_foreign,
-        "proprietaryNetSeries": trend_prop,
+        "proprietaryNetSeries": None,
     }
 
 
@@ -2845,6 +2897,10 @@ def _compute_vn30_market_flow(
                 continue
             fseries = payload.get("foreignNetSeries") or []
             pseries = payload.get("proprietaryNetSeries") or []
+            # `proprietaryNetSeries` nay LUÔN None (nguồn không có tự doanh — xem ghi chú TỰ DOANH
+            # ở `_compute_money_flow_for_symbol`), nên vế `or pseries` đã chết: `used` thực chất
+            # đếm "số mã có chuỗi KHỐI NGOẠI". Giữ nguyên biểu thức để khi nào có nguồn tự doanh
+            # thật thì nó tự sống lại, nhưng ĐỪNG đọc `marketFlowSampleSize` như cỡ mẫu của tự doanh.
             if fseries or pseries:
                 used += 1
             for pt in fseries:
